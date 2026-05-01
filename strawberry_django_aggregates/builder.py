@@ -104,6 +104,17 @@ class AggregateBuilder:
         permission scoping. Defaults to
         ``model._default_manager.all()`` — callers wanting
         ``accessible_by(user)`` semantics override this hook.
+    enable_federation : when ``True``, emit Apollo Federation v2
+        directives on the generated types — currently ``@external`` on
+        the foreign-key ``<name>_id`` fields of ``<Model>GroupKey`` (so
+        a Federation gateway knows those IDs are owned by another
+        subgraph). The aggregate / grouped containers themselves are
+        decorated with :func:`strawberry.federation.type` but carry no
+        ``@key`` directive in v1.0; consumers register their own entity
+        ``@key`` if they need cross-subgraph composition. Consumers
+        MUST construct the schema with
+        :class:`strawberry.federation.Schema` for directives to print.
+        See SPEC § 18 for the design rationale and v1.1 roadmap.
     """
 
     model:            type[Model]
@@ -114,6 +125,7 @@ class AggregateBuilder:
     )
     name_prefix:      str | None = None
     filter_type:      type | None = None
+    enable_federation: bool = False
     get_queryset:     Callable[[Any], QuerySet] | None = None
     respect_comodel_ordering: bool = False
 
@@ -126,17 +138,20 @@ class AggregateBuilder:
             name=name,
             aggregate_fields=self.aggregate_fields,
             operators=self.operators,
+            enable_federation=self.enable_federation,
         )
         having_input = make_having_input(
             self.model,
             name=name,
             aggregate_fields=self.aggregate_fields,
             operators=self.operators,
+            enable_federation=self.enable_federation,
         )
         group_by_spec, groupable_field_enum = make_group_by_spec(
             self.model,
             name=name,
             group_by_fields=self.group_by_fields,
+            enable_federation=self.enable_federation,
         )
         group_key_type, grouped_type, grouped_result_type = (
             make_grouped_type(
@@ -146,9 +161,13 @@ class AggregateBuilder:
                 aggregate_fields=self.aggregate_fields,
                 group_by_fields=self.group_by_fields,
                 operators=self.operators,
+                enable_federation=self.enable_federation,
             )
         )
-        group_order_input = make_group_order_input(self.model, name=name)
+        group_order_input = make_group_order_input(
+            self.model, name=name,
+            enable_federation=self.enable_federation,
+        )
 
         aggregate_field = self._build_aggregate_field(
             aggregate_type=aggregate_type,

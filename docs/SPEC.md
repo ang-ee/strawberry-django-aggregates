@@ -493,13 +493,66 @@ tests/
 
 - **Cursor pagination on grouped results.** Offset only for v1.
 - **Aggregate-of-relation as a parent field** (e.g. `order.itemsAggregate`). Would need a `Subquery` emission strategy. Documented alternative (top-level child query) covers most cases. Possible v2.
-- **Strawberry Federation v2 directives** on emitted types (`@key`, `@external`, etc.). The types are plain Strawberry types and play with Federation, but there's no first-class wiring yet.
+- **Apollo Federation v2 first-class wiring.** v1.0 ships an opt-in `enable_federation` flag on `AggregateBuilder` that emits `@external` on `<Model>GroupKey` FK fields and decorates emitted types with `strawberry.federation.type`. Full `@key` / `@requires` / `@provides` semantics are deferred — see § 18.
 - **Window functions** (`ROW_NUMBER`, `RANK`, `LAG`, etc.). Adjacent feature space; would need a new `<Model>Windowed` shape. Out of scope.
 - **Streaming / chunked group-by** for cardinality > 100k group buckets. Memory pressure is real; v2 might add a `chunk_size` parameter to `compute_aggregation` and a streaming resolver.
 
 ## 16 · Versioning
 
 The `AggregateOp` enum and the `compute_aggregation` signature are part of the SemVer contract — breaking changes bump major. The Strawberry types it emits inherit Strawberry's evolution semantics (deprecate fields, never break them in a minor release). The library tracks `strawberry-graphql-django` minor versions; major bumps there may force a major bump here.
+
+## 18 · Apollo Federation v2 support
+
+Federation v2 is an additive, opt-in concern. The library does not control schema construction (the consumer does) — we only emit federation-decorated types and trust the consumer to wire `strawberry.federation.Schema`.
+
+### The flag
+
+`AggregateBuilder(enable_federation=True)` switches the emitted types to their `strawberry.federation.*` counterparts:
+
+| When `enable_federation=False` (default) | When `enable_federation=True`           |
+| ---------------------------------------- | ---------------------------------------- |
+| `strawberry.type`                        | `strawberry.federation.type`             |
+| `strawberry.input`                       | `strawberry.federation.input`            |
+| FK group-key fields are plain dataclass attrs | FK `<name>_id` fields use `strawberry.federation.field(external=True)` |
+
+The flag forwards to every type-generator (`make_aggregate_type`, `make_grouped_type`, `make_having_input`, `make_group_by_spec`, `make_group_order_input`).
+
+### What v1.0 actually emits
+
+When `enable_federation=True` and the consumer constructs the schema with `strawberry.federation.Schema(...)`:
+
+- `<Model>Aggregate`, `<Model>Grouped`, `<Model>GroupedResult`, `<Model>SumFields` and the rest of the nested-operator types are decorated with `strawberry.federation.type`. They register with the federation subgraph but carry **no `@key` directive** in v1.0.
+- `<Model>GroupKey` foreign-key columns (e.g. `customerId` from `customer = ForeignKey(...)`) are emitted with `@external`, telling the gateway that the canonical record for that ID lives in another subgraph.
+- `<Model>Having`, `<Model>GroupBySpec`, `<Model>GroupOrder` are decorated with `strawberry.federation.input`.
+
+Schema sample (federation on, FK group-key field):
+
+```graphql
+type OrderGroupKey {
+  customerId: Int @external
+  status: String
+  createdAt: DateTime
+  # ... bucket aliases
+}
+```
+
+### Schema construction is the consumer's job
+
+The library never constructs a `Schema`. The consumer must use `strawberry.federation.Schema` (NOT plain `strawberry.Schema`) for `@external` and the federation `_service` field to print correctly. With a plain `strawberry.Schema`, the federation directives may still appear in the SDL but the gateway's federation-protocol introspection (`_service { sdl }`) will not be wired. Document this in the consumer's schema-wiring code.
+
+### Why no `@key` on `<Model>Aggregate` in v1.0
+
+A `@key` directive identifies an entity that subgraphs can reference by an opaque key. Aggregate result containers (`OrderAggregate`, `OrderGrouped`) have no natural identity — they are derived projections of a queryset, not entities. The keying semantics over an aggregate result are not yet a settled best practice in the Apollo Federation community, and shipping a half-baked default `@key` would be harder to remove later than to add. Consumers who need an entity-shaped aggregate (rare; usually they want to register the FK target as the entity and let the gateway compose) can register their own `@key` post-decoration.
+
+### v1.1 roadmap
+
+- `@key` on `<Model>Aggregate` once the keying convention stabilizes (likely a derived key over the group-by tuple).
+- `@requires` / `@provides` for cases where one subgraph needs additional fields from another to compute an aggregate.
+- Per-field federation directive overrides via the `operators` / per-field-config surface.
+
+### Determinism
+
+The `enable_federation` branch is fully deterministic — same inputs produce byte-identical SDL across two generations. The federation `field(external=True)` re-binding happens during `_emit_group_key` before the `strawberry.federation.type` decorator runs, so the emitted type signature is stable.
 
 ---
 
