@@ -155,20 +155,23 @@ enum Granularity {
 
 ```
 AggregateOp = StrEnum:
-    COUNT          = "count"
-    COUNT_DISTINCT = "count_distinct"
-    SUM            = "sum"
-    AVG            = "avg"
-    MIN            = "min"
-    MAX            = "max"
-    STDDEV         = "stddev"          # Postgres only — sample stddev
-    VARIANCE       = "variance"        # Postgres only — sample variance
-    STDDEV_POP     = "stddev_pop"      # Postgres only — population stddev
-    VAR_POP        = "var_pop"         # Postgres only — population variance
-    BOOL_AND       = "bool_and"
-    BOOL_OR        = "bool_or"
-    ARRAY_AGG      = "array_agg"       # Postgres only
-    STRING_AGG     = "string_agg"      # Postgres only
+    COUNT           = "count"
+    COUNT_DISTINCT  = "count_distinct"
+    SUM             = "sum"
+    AVG             = "avg"
+    MIN             = "min"
+    MAX             = "max"
+    STDDEV          = "stddev"           # Postgres only — sample stddev
+    VARIANCE        = "variance"         # Postgres only — sample variance
+    STDDEV_POP      = "stddev_pop"       # Postgres only — population stddev
+    VAR_POP         = "var_pop"          # Postgres only — population variance
+    PERCENTILE_CONT = "percentile_cont"  # Postgres only — interpolated percentile
+    PERCENTILE_DISC = "percentile_disc"  # Postgres only — discrete percentile
+    MODE            = "mode"             # Postgres only — most-frequent value
+    BOOL_AND        = "bool_and"
+    BOOL_OR         = "bool_or"
+    ARRAY_AGG       = "array_agg"        # Postgres only
+    STRING_AGG      = "string_agg"       # Postgres only
 ```
 
 Direct mapping to SQL — no operator outside this enum reaches the database:
@@ -184,6 +187,9 @@ Direct mapping to SQL — no operator outside this enum reaches the database:
 | `variance` | `VAR_SAMP(col)` | **Postgres only** | `Float` |
 | `stddev_pop` | `STDDEV_POP(col)` | **Postgres only** | `Float` |
 | `var_pop` | `VAR_POP(col)` | **Postgres only** | `Float` |
+| `percentile_cont` | `PERCENTILE_CONT(<fraction>) WITHIN GROUP (ORDER BY col)` | **Postgres only** | `Float` |
+| `percentile_disc` | `PERCENTILE_DISC(<fraction>) WITHIN GROUP (ORDER BY col)` | **Postgres only** | `Float` (cast in v1.0; column type in v1.x) |
+| `mode` | `MODE() WITHIN GROUP (ORDER BY col)` | **Postgres only** | type of `col` |
 | `bool_and` | `BOOL_AND(col)` | Postgres native; SQLite emulated via `MIN(col::int)::bool` | `Boolean` |
 | `bool_or` | `BOOL_OR(col)` | Postgres native; SQLite emulated via `MAX(col::int)::bool` | `Boolean` |
 | `array_agg` | `ARRAY_AGG(col ORDER BY <pk>)` | **Postgres only** | `[ID!]` or `[String!]` etc. |
@@ -199,10 +205,10 @@ Field types map to default operator allowlists. Consumers can narrow further via
 
 | Django field type | Default operators |
 |---|---|
-| `IntegerField`, `BigIntegerField`, `FloatField`, `DecimalField`, `DurationField` | `sum, avg, min, max, stddev, variance, stddev_pop, var_pop` |
-| `DateField`, `DateTimeField`, `TimeField` | `min, max` |
+| `IntegerField`, `BigIntegerField`, `FloatField`, `DecimalField`, `DurationField` | `sum, avg, min, max, stddev, variance, stddev_pop, var_pop, percentile_cont, percentile_disc, mode` |
+| `DateField`, `DateTimeField`, `TimeField` | `min, max, percentile_disc, mode` |
 | `BooleanField` | `bool_and, bool_or` |
-| `CharField`, `TextField`, `EmailField`, `URLField`, `SlugField` | `min, max, array_agg, string_agg` |
+| `CharField`, `TextField`, `EmailField`, `URLField`, `SlugField` | `min, max, mode, array_agg, string_agg` |
 | `UUIDField`, `AutoField`, `BigAutoField` | `array_agg` (by ID) |
 | `ForeignKey`, `OneToOneField` | `array_agg` (by FK ID) |
 | `ManyToManyField`, reverse FK | **none** — would row-multiply |
@@ -246,6 +252,95 @@ Standard SQL three-valued-logic applies. Every emitted measure field on
   (`qs.exclude(<field>__isnull=True)`). The library does not currently
   emit `FILTER (WHERE col IS NOT NULL)` clauses; this is documented
   behavior, not a bug.
+
+### 5.1 · Ordered-set aggregates — `percentile_cont`, `percentile_disc`, `mode`
+
+PostgreSQL's ordered-set aggregates take a per-call literal that does
+not fit the `(operator, field)` 2-tuple shape of the rest of the
+catalog. We split the wire surface in two:
+
+**`mode`** is a regular nested-type op. `<Model>ModeFields` carries one
+field per allowlisted column whose type permits a most-frequent value
+(numeric / string / date). The result type matches the column type —
+same shape as `min` / `max`.
+
+**`percentile_cont` / `percentile_disc`** are **method-style fields** on
+`<Model>Aggregate`, mirroring the `count_distinct(field:)` pattern:
+
+```graphql
+type OrderAggregate {
+  count:           Int!
+  countDistinct(field: OrderCountableField!): Int!
+  percentileCont(
+    field: OrderPercentileField!
+    fraction: Float!
+  ): Float
+  percentileDisc(
+    field: OrderPercentileField!
+    fraction: Float!
+  ): Float
+  # ... regular nested-type fields below
+}
+```
+
+`fraction` must be in `[0, 1]`; out-of-range values raise `ValueError`
+at resolver entry, before any SQL fires.
+
+**`percentileDisc` returns `Float` in v1.0**, even when the underlying
+column is `Decimal`, `Date`, or any other type. The discrete-percentile
+result is cast to `Float` to keep the wire surface uniform with
+`percentileCont`. Callers who need full type fidelity (e.g. a
+date-column percentile returning `DateTime`) should compute in
+application code or wait for v1.x — the type-faithful resolution
+requires per-field-type method emission and is out of v1.0 scope.
+
+**Alias scheme.** Multiple percentile calls can coexist in one query
+because the SQL alias encodes the fraction:
+
+| Call | Alias |
+|---|---|
+| `percentile_cont(total, fraction=0.5)` | `percentile_cont_total_50` |
+| `percentile_cont(total, fraction=0.95)` | `percentile_cont_total_95` |
+| `percentile_disc(total, fraction=0.999)` | `percentile_disc_total_999` |
+| `percentile_cont(total, fraction=0.05)` | `percentile_cont_total_5` |
+| `mode(total)` | `mode_total` |
+
+The fraction is rendered as `int(round(fraction * 1000))` with a
+trailing-zero collapse so common P50 / P95 / P99 read naturally
+(`50` / `95` / `99`) while finer-grained fractions like P99.9 keep
+their precision (`999`).
+
+**Backend channel.** `compute_aggregation` accepts a parallel-dict
+`op_args` keyed by the bare `<op>_<field>` alias (no fraction suffix —
+that suffix is *derived* from the fraction itself):
+
+```python
+compute_aggregation(
+    qs,
+    aggregates=[
+        (AggregateOp.PERCENTILE_CONT, "total"),
+        (AggregateOp.PERCENTILE_DISC, "total"),
+    ],
+    op_args={
+        "percentile_cont_total": {"fraction": 0.5},
+        "percentile_disc_total": {"fraction": 0.95},
+    },
+)
+```
+
+`op_args` is the only escape hatch for per-call kwargs that don't fit
+the 2-tuple shape; refactoring `aggregates` to a 3-tuple was
+considered and rejected as too invasive for v1.0.
+
+**HAVING and ordering** on percentile measures are deferred. The
+fraction-suffixed alias does not roundtrip cleanly through the static
+`<Model>Having` input shape, and ordering by a percentile column would
+require percentile-aware translation of the order term. Method-style
+fields cover the common usage (P50 / P95 / P99 at top level). Filter
+or order on the underlying queryset directly if you need either.
+
+**`mode` works in HAVING and ordering** like any other regular nested
+op — its alias is the simple `mode_<field>` form.
 
 ## 6 · Group-by spec
 
@@ -447,7 +542,7 @@ Type generation produces the same SDL for the same inputs. Rules:
 
 - Iterate field allowlists in declaration order (preserves Python dict insertion order).
 - Iterate operator overrides in `sorted()` key order.
-- Emit operator nested types (`<Model>SumFields` etc.) in canonical operator order: `count, count_distinct, sum, avg, min, max, stddev, variance, stddev_pop, var_pop, bool_and, bool_or, array_agg, string_agg`.
+- Emit operator nested types (`<Model>SumFields` etc.) in canonical operator order: `count, count_distinct, sum, avg, min, max, stddev, variance, stddev_pop, var_pop, percentile_cont, percentile_disc, mode, bool_and, bool_or, array_agg, string_agg`. (`percentile_cont` and `percentile_disc` occupy slots in the canonical order so the enum stays stable, but they are emitted as method-style fields on `<Model>Aggregate` — no nested type — per § 5.1.)
 - Emit HAVING input fields by `(measure, comparison)` in canonical comparison order: `Gt, Lt, Lte, Gte, Eq, Neq, In, NotIn`.
 - No timestamps, no PRNG, no `datetime.now()`, no `uuid4()`, no insertion-order-sensitive iteration.
 

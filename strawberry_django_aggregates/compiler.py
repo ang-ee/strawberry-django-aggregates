@@ -28,6 +28,7 @@ from django.db.models import (
     DateField,
     DateTimeField,
     F,
+    FloatField,
     Func,
     IntegerField,
     Max,
@@ -74,6 +75,9 @@ _POSTGRES_ONLY_OPS: frozenset[AggregateOp] = frozenset({
     AggregateOp.VARIANCE,
     AggregateOp.STDDEV_POP,
     AggregateOp.VAR_POP,
+    AggregateOp.PERCENTILE_CONT,
+    AggregateOp.PERCENTILE_DISC,
+    AggregateOp.MODE,
     AggregateOp.ARRAY_AGG,
     AggregateOp.STRING_AGG,
 })
@@ -145,6 +149,85 @@ class _ExtractDayOfYear(TimezoneMixin, Func):
 
 
 # ---------------------------------------------------------------------------
+# Ordered-set aggregates — PERCENTILE_CONT / PERCENTILE_DISC / MODE
+# ---------------------------------------------------------------------------
+#
+# Django ships no `PercentileCont` / `PercentileDisc` / `Mode` aggregates,
+# so we subclass :class:`Aggregate` and emit the ordered-set syntax via
+# the template. PG-only — :func:`_validate_postgres_only` raises before
+# any of these can hit SQLite. The ``fraction`` literal is rendered into
+# the SQL template (NOT bound as a parameter) because PG's grammar
+# requires a literal there; we coerce to ``float`` and re-render via
+# ``str(float(...))`` so the only character classes that reach the
+# template are digits, ``.``, and ``-``. No user-supplied string ever
+# touches the template — see SPEC § 5.1 + CLAUDE.md Critical Rule 9.
+
+
+def _validate_fraction(fraction: float) -> float:
+    f = float(fraction)
+    if not 0.0 <= f <= 1.0:
+        raise ValueError(
+            f"`fraction` must be in [0, 1], got {fraction!r}.",
+        )
+    return f
+
+
+class _PercentileCont(Aggregate):
+    """``PERCENTILE_CONT(<fraction>) WITHIN GROUP (ORDER BY <expr>)``.
+
+    Continuous percentile — interpolates between adjacent values when
+    the fraction does not land on a row boundary. PG-only.
+    """
+
+    function = "PERCENTILE_CONT"
+    template = (
+        "%(function)s(%(fraction)s) WITHIN GROUP (ORDER BY %(expressions)s)"
+    )
+    output_field = FloatField()
+
+    def __init__(
+        self, expression: Any, fraction: float, **extra: Any,
+    ) -> None:
+        f = _validate_fraction(fraction)
+        super().__init__(expression, fraction=str(f), **extra)
+
+
+class _PercentileDisc(Aggregate):
+    """``PERCENTILE_DISC(<fraction>) WITHIN GROUP (ORDER BY <expr>)``.
+
+    Discrete percentile — returns the first row value whose cumulative
+    distribution meets the fraction. PG-only.
+
+    Output is cast to ``Float`` for v1.0 — see SPEC § 5.1. Full
+    type-faithful resolution (return the column type) lands in v1.x.
+    """
+
+    function = "PERCENTILE_DISC"
+    template = (
+        "%(function)s(%(fraction)s) WITHIN GROUP (ORDER BY %(expressions)s)"
+    )
+    output_field = FloatField()
+
+    def __init__(
+        self, expression: Any, fraction: float, **extra: Any,
+    ) -> None:
+        f = _validate_fraction(fraction)
+        super().__init__(expression, fraction=str(f), **extra)
+
+
+class _Mode(Aggregate):
+    """``MODE() WITHIN GROUP (ORDER BY <expr>)``.
+
+    Most-frequent value. Returns the column type — output_field is
+    inferred from the source expression at SQL-generation time.
+    PG-only.
+    """
+
+    function = "MODE"
+    template = "%(function)s() WITHIN GROUP (ORDER BY %(expressions)s)"
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -159,6 +242,7 @@ def compute_aggregation(
     limit:      int | None = None,
     tz:         str | None = None,
     respect_comodel_ordering: bool = False,
+    op_args:    dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Compile a queryset into an aggregation query.
 
@@ -170,11 +254,21 @@ def compute_aggregation(
     ``Meta.ordering`` as additional ORDER BY tiebreakers. Mirrors Odoo
     ``_order_field_to_sql`` (``odoo/models.py:2253``). Off by default
     so the determinism contract for existing callers is unchanged.
+
+    ``op_args`` is the parallel-dict channel for per-call operator
+    arguments that don't fit the ``(op, field)`` 2-tuple shape — chiefly
+    the ``fraction`` for ``PERCENTILE_CONT`` / ``PERCENTILE_DISC``.
+    Keyed by alias (e.g. ``"percentile_cont_total_50"``), value is a
+    dict of kwargs forwarded to the underlying Django ``Aggregate``
+    subclass. Aliases that don't appear here fall back to operator
+    defaults (currently only the percentile ops require a fraction —
+    ``MODE`` and the rest take no extra args).
     """
     group_by    = group_by    or []
     aggregates  = aggregates  or []
     having      = having      or {}
     order_by    = order_by    or []
+    op_args     = op_args     or {}
     vendor      = connections[queryset.db].vendor
     model       = queryset.model
     tz_name     = tz or settings.TIME_ZONE
@@ -194,7 +288,7 @@ def compute_aggregation(
     )
 
     aggregate_annotations = _build_aggregate_annotations(
-        model, aggregates, vendor,
+        model, aggregates, vendor, op_args,
     )
 
     having_q = _build_having_q(having, aggregate_annotations.keys())
@@ -400,26 +494,67 @@ def _build_aggregate_annotations(
     model: type,
     aggregates: list[tuple[AggregateOp, str | None]],
     vendor: str,
+    op_args: dict[str, dict[str, Any]],
 ) -> dict[str, Aggregate]:
     annotations: dict[str, Aggregate] = {}
     for op, field_path in aggregates:
         if field_path is not None:
-            _resolve_field(model, field_path, GroupByFieldNotAllowed)
-        alias = aggregate_alias(op, field_path)
+            field = _resolve_field(model, field_path, GroupByFieldNotAllowed)
+        else:
+            field = None
+        extra: dict[str, Any] = {}
+        if op in {AggregateOp.PERCENTILE_CONT, AggregateOp.PERCENTILE_DISC}:
+            assert field_path is not None
+            fraction = _require_fraction(op_args, op, field_path)
+            extra["fraction"] = fraction
+        alias = aggregate_alias(op, field_path, **extra)
         annotations[alias] = _build_aggregate_expression(
-            op, field_path, vendor,
+            op, field_path, vendor, field, extra,
         )
     return annotations
 
 
+def _require_fraction(
+    op_args: dict[str, dict[str, Any]],
+    op: AggregateOp,
+    field_path: str,
+) -> float:
+    """Resolve the ``fraction`` arg for a percentile op.
+
+    Looks up by the bare ``<op>_<field>`` alias *without* the trailing
+    ``_<NN>`` percentile suffix — that suffix is *derived* from the
+    fraction, so ``op_args`` must be keyed by the underlying call site,
+    not the resulting SQL alias. Raises if missing or out of range.
+    """
+    base_alias = f"{op.value}_{field_path}"
+    args = op_args.get(base_alias)
+    if not args or "fraction" not in args:
+        raise ValueError(
+            f"Operator {op.value!r} on field `{field_path}` requires a "
+            f"`fraction` argument in [0, 1]. Pass it via "
+            f"`op_args={{{base_alias!r}: {{'fraction': <float>}}}}`.",
+        )
+    return _validate_fraction(args["fraction"])
+
+
 def aggregate_alias(
-    op: AggregateOp, field_path: str | None,
+    op: AggregateOp, field_path: str | None, **extra: Any,
 ) -> str:
     """Canonical alias for an ``(op, field)`` aggregate spec.
 
     - ``(COUNT, None)`` → ``"count"``
     - ``(COUNT_DISTINCT, "customer")`` → ``"count_distinct_customer"``
     - ``(SUM, "total")`` → ``"sum_total"``
+    - ``(PERCENTILE_CONT, "total", fraction=0.5)`` →
+      ``"percentile_cont_total_50"``
+    - ``(PERCENTILE_DISC, "total", fraction=0.95)`` →
+      ``"percentile_disc_total_95"``
+    - ``(MODE, "total")`` → ``"mode_total"``
+
+    Percentile aliases include a ``_<NN>`` suffix encoding the fraction
+    as an integer percentile (``0.5`` → ``50``; ``0.05`` → ``5``;
+    ``0.999`` → ``999``). This lets multiple percentile calls coexist
+    in the same query without alias collisions.
     """
     if op is AggregateOp.COUNT:
         return "count"
@@ -427,12 +562,46 @@ def aggregate_alias(
         raise ValueError(
             f"Operator {op.value!r} requires a field path."
         )
+    if op in {AggregateOp.PERCENTILE_CONT, AggregateOp.PERCENTILE_DISC}:
+        if "fraction" not in extra:
+            raise ValueError(
+                f"Operator {op.value!r} requires a `fraction` keyword "
+                f"argument to compute its alias.",
+            )
+        return (
+            f"{op.value}_{field_path}_"
+            f"{_fraction_to_alias_suffix(extra['fraction'])}"
+        )
     return f"{op.value}_{field_path}"
 
 
+def _fraction_to_alias_suffix(fraction: float) -> str:
+    """Encode a fraction in [0, 1] as an integer-percentile suffix.
+
+    ``0.5`` → ``"50"``; ``0.95`` → ``"95"``; ``0.999`` → ``"999"``.
+    Strips trailing zeros after the integer part so common percentiles
+    have stable two-digit aliases.
+    """
+    f = _validate_fraction(fraction)
+    # Multiply up to 1000 (handles fractions like 0.001) then strip
+    # trailing zeros down to two digits minimum so common P50/P95/P99
+    # have predictable aliases.
+    millis = int(round(f * 1000))
+    # Most callers use values like 0.5 / 0.95 / 0.99 — collapse to "50"
+    # / "95" / "99" rather than "500" / "950" / "990".
+    if millis % 10 == 0:
+        return str(millis // 10)
+    return str(millis)
+
+
 def _build_aggregate_expression(
-    op: AggregateOp, field_path: str | None, vendor: str,
+    op: AggregateOp,
+    field_path: str | None,
+    vendor: str,
+    field: Field | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> Aggregate:
+    extra = extra or {}
     if op is AggregateOp.COUNT:
         return Count("pk")
     if op is AggregateOp.COUNT_DISTINCT:
@@ -454,6 +623,24 @@ def _build_aggregate_expression(
         return StdDev(field_path, sample=False)  # type: ignore[arg-type]
     if op is AggregateOp.VAR_POP:
         return Variance(field_path, sample=False)  # type: ignore[arg-type]
+    if op is AggregateOp.PERCENTILE_CONT:
+        assert field_path is not None
+        return _PercentileCont(field_path, fraction=extra["fraction"])
+    if op is AggregateOp.PERCENTILE_DISC:
+        assert field_path is not None
+        return _PercentileDisc(field_path, fraction=extra["fraction"])
+    if op is AggregateOp.MODE:
+        assert field_path is not None
+        # Match the source field's natural output type so MODE over a
+        # CharField returns String, MODE over a DateField returns Date,
+        # etc. ``_output_field_or_none`` is Django's documented hook.
+        kwargs: dict[str, Any] = {}
+        if field is not None:
+            of = getattr(field, "_output_field_or_none", None)
+            of_value = of() if callable(of) else None
+            if of_value is not None:
+                kwargs["output_field"] = of_value
+        return _Mode(field_path, **kwargs)
     if op is AggregateOp.BOOL_AND:
         return _bool_and(field_path, vendor)
     if op is AggregateOp.BOOL_OR:

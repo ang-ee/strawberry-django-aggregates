@@ -154,6 +154,11 @@ _ROW_OPERATORS: tuple[AggregateOp, ...] = (
 )
 
 # Operators that materialize a `<Model>{Op}Fields` nested type.
+#
+# ``PERCENTILE_CONT`` / ``PERCENTILE_DISC`` are listed for canonical
+# emission ordering (SPEC § 12) but :func:`_emit_nested_operator_types`
+# skips their nested type — they go method-style on ``<Model>Aggregate``
+# instead so the client can pass a ``fraction`` argument per call.
 _FIELD_OPERATORS: tuple[AggregateOp, ...] = (
     AggregateOp.SUM,
     AggregateOp.AVG,
@@ -163,11 +168,22 @@ _FIELD_OPERATORS: tuple[AggregateOp, ...] = (
     AggregateOp.VARIANCE,
     AggregateOp.STDDEV_POP,
     AggregateOp.VAR_POP,
+    AggregateOp.PERCENTILE_CONT,
+    AggregateOp.PERCENTILE_DISC,
+    AggregateOp.MODE,
     AggregateOp.BOOL_AND,
     AggregateOp.BOOL_OR,
     AggregateOp.ARRAY_AGG,
     AggregateOp.STRING_AGG,
 )
+
+# Operators wired as method-style fields on ``<Model>Aggregate`` —
+# never emit a nested ``<Model>{Op}Fields`` type. They take an extra
+# argument (``fraction``) the regular nested-dict shape can't carry.
+_METHOD_STYLE_OPERATORS: frozenset[AggregateOp] = frozenset({
+    AggregateOp.PERCENTILE_CONT,
+    AggregateOp.PERCENTILE_DISC,
+})
 
 # Comparisons emitted into HAVING input — same canonical order as
 # CLAUDE.md Critical Rule 2 demands for determinism.
@@ -262,6 +278,17 @@ def _aggregate_python_type(op: AggregateOp, field: Field) -> Any:
         AggregateOp.VAR_POP,
     }:
         return float
+    if op in {AggregateOp.PERCENTILE_CONT, AggregateOp.PERCENTILE_DISC}:
+        # Method-style fields define their own return type; the
+        # nested-type emitter never asks for these values, but we
+        # answer for callers that introspect the helper directly.
+        # ``percentile_disc`` returns ``Float`` in v1.0 (cast); full
+        # type-faithful resolution lands in v1.x — see SPEC § 5.1.
+        return float
+    if op is AggregateOp.MODE:
+        # ``MODE() WITHIN GROUP (ORDER BY col)`` returns the column
+        # type — same shape as ``MIN``/``MAX``.
+        return _natural_python_type(field)
     if op in {AggregateOp.BOOL_AND, AggregateOp.BOOL_OR}:
         return bool
     if op is AggregateOp.ARRAY_AGG:
@@ -420,6 +447,65 @@ def make_aggregate_type(
         description="COUNT(DISTINCT <field>) — pass the field to count.",
     )
 
+    # PERCENTILE_CONT / PERCENTILE_DISC are method-style for the same
+    # reason as ``count_distinct``: they take an extra argument
+    # (``fraction``) the regular nested-dict shape can't carry. Both
+    # share a single ``<Model>PercentileField`` enum listing fields
+    # whose allowlist includes ``PERCENTILE_CONT`` (or
+    # ``PERCENTILE_DISC``). Wired only when at least one field in the
+    # allowlist supports either operator — otherwise the enum would
+    # have no members and Strawberry would fail at schema build time.
+    percentile_enum = _emit_percentile_enum(
+        model, name, fields, overrides,
+    )
+    if percentile_enum is not None:
+        def _percentile_cont_resolver(
+            self: Any, field: Any, fraction: float,
+        ) -> float | None:
+            backing = (
+                getattr(self, "__percentile_cont__", None) or {}
+            )
+            value = backing.get((field.value, float(fraction)))
+            return None if value is None else float(value)
+
+        _percentile_cont_resolver.__annotations__ = {
+            "self":     Any,
+            "field":    percentile_enum,
+            "fraction": float,
+            "return":   float | None,
+        }
+        cls.percentile_cont = strawberry.field(  # type: ignore[attr-defined]
+            resolver=_percentile_cont_resolver,
+            description=(
+                "PERCENTILE_CONT(fraction) WITHIN GROUP (ORDER BY field) — "
+                "interpolated percentile. Postgres only."
+            ),
+        )
+
+        def _percentile_disc_resolver(
+            self: Any, field: Any, fraction: float,
+        ) -> float | None:
+            backing = (
+                getattr(self, "__percentile_disc__", None) or {}
+            )
+            value = backing.get((field.value, float(fraction)))
+            return None if value is None else float(value)
+
+        _percentile_disc_resolver.__annotations__ = {
+            "self":     Any,
+            "field":    percentile_enum,
+            "fraction": float,
+            "return":   float | None,
+        }
+        cls.percentile_disc = strawberry.field(  # type: ignore[attr-defined]
+            resolver=_percentile_disc_resolver,
+            description=(
+                "PERCENTILE_DISC(fraction) WITHIN GROUP (ORDER BY field) — "
+                "discrete percentile. Returns Float in v1.0; full type "
+                "fidelity in v1.x. Postgres only."
+            ),
+        )
+
     return _type_decorator(enable_federation)(cls)
 
 
@@ -440,6 +526,11 @@ def _emit_nested_operator_types(
     decorator = _type_decorator(enable_federation)
     out: dict[AggregateOp, type] = {}
     for op in _FIELD_OPERATORS:
+        # PERCENTILE_CONT / PERCENTILE_DISC are method-style — they
+        # receive the ``field`` and ``fraction`` as resolver args and
+        # return a single ``Float`` directly. No nested type.
+        if op in _METHOD_STYLE_OPERATORS:
+            continue
         op_fields: list[tuple[str, Any, Any]] = []
         for field_name in fields:
             allowed = _allowed_ops_for(model, field_name, overrides)
@@ -459,6 +550,41 @@ def _emit_nested_operator_types(
 def _op_class_suffix(op: AggregateOp) -> str:
     """``AggregateOp.SUM`` → ``"Sum"``; ``BOOL_AND`` → ``"BoolAnd"``."""
     return "".join(part.capitalize() for part in op.value.split("_"))
+
+
+def _emit_percentile_enum(
+    model: type[Model],
+    name: str,
+    fields: list[str],
+    overrides: dict[str, tuple[AggregateOp, ...]],
+) -> type[enum.Enum] | None:
+    """Build ``<Model>PercentileField`` — fields whose allowlist allows
+    either percentile op.
+
+    Shared by ``percentileCont`` and ``percentileDisc`` resolvers; if
+    a field allows one but not the other, the resolver still works
+    (the request raises ``OperatorNotSupportedError`` only at compile
+    time when the op is dispatched against an unallowed field). For
+    v1.0 we keep the enum permissive; finer per-op enums are deferred.
+
+    Returns ``None`` when no field on the allowlist supports either
+    percentile op — in that case the caller must skip method-field
+    emission entirely (Strawberry rejects an empty enum).
+    """
+    members: list[tuple[str, str]] = []
+    for field_name in fields:
+        allowed = _allowed_ops_for(model, field_name, overrides)
+        if (
+            AggregateOp.PERCENTILE_CONT in allowed
+            or AggregateOp.PERCENTILE_DISC in allowed
+        ):
+            members.append((field_name.upper(), field_name))
+    if not members:
+        return None
+    enum_cls = enum.Enum(  # type: ignore[misc]
+        f"{name}PercentileField", members,
+    )
+    return strawberry.enum(enum_cls)
 
 
 def _emit_countable_enum(
@@ -664,6 +790,12 @@ def make_having_input(
     measures.append(("count", int))
 
     for op in _FIELD_OPERATORS:
+        # Method-style ops (PERCENTILE_CONT/DISC) emit no HAVING field
+        # in v1.0 — their canonical alias encodes the fraction
+        # (``percentile_cont_total_50``) which the static HAVING-input
+        # shape can't carry. HAVING on percentiles is deferred.
+        if op in _METHOD_STYLE_OPERATORS:
+            continue
         for field_name in fields:
             allowed = _allowed_ops_for(model, field_name, overrides)
             if op not in allowed:
