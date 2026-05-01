@@ -59,3 +59,15 @@ class GroupByFieldNotAllowed(AggregateError):
 
 class GranularityNotApplicable(AggregateError):
     """Raised when granularity is set on a non-date / non-datetime field."""
+
+
+class JSONPathNotAllowed(AggregateError):
+    """Raised when a dotted JSON path is not in the caller's allowlist.
+
+    The first segment of a dotted ``metadata.region`` path resolves to a
+    Django ``JSONField`` on the model, but the full path was not declared
+    in the ``json_paths`` allowlist passed to
+    :func:`compute_aggregation` / :class:`AggregateBuilder`. Mirrors the
+    fail-loud semantics of :class:`GroupByFieldNotAllowed` — opting in to
+    a JSON path is explicit, never auto-discovered. See SPEC § 6.1.
+    """

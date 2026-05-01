@@ -41,6 +41,10 @@ class Order(models.Model):
     quantity    = models.IntegerField(default=1)
     is_priority = models.BooleanField(default=False)
     created_at  = models.DateTimeField()
+    # Stream 17 — JSONB-stored properties for analytics. Tests pin the
+    # group_by + aggregation behaviour over typed JSON paths
+    # (``metadata.region``, ``metadata.amount``, ``metadata.created_at_iso``).
+    metadata    = models.JSONField(default=dict, blank=True)
 
     class Meta:
         app_label = "tests"
