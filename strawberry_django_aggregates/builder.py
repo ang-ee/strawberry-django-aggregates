@@ -17,6 +17,7 @@ finer control (see :mod:`strawberry_django_aggregates.types`).
 from __future__ import annotations
 
 import dataclasses
+import datetime
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -271,6 +272,9 @@ class AggregateBuilder:
             order_by:  Any = None,
             pagination: OffsetPaginationInput | None = None,
             week_start: int = 1,
+            fill: bool = False,
+            fill_min: datetime.datetime | None = None,
+            fill_max: datetime.datetime | None = None,
         ) -> Any:
             qs = builder._resolve_queryset(info)
             if filter is not None:
@@ -296,6 +300,18 @@ class AggregateBuilder:
             # boundary so a bad value fails fast before any SQL.
             ws = builder._resolve_week_start(week_start)
 
+            # Strawberry passes ``UNSET`` for omitted optional inputs;
+            # normalize to None so downstream code can use plain
+            # ``is None`` checks.
+            fmin = (
+                fill_min if fill_min not in (None, strawberry.UNSET)
+                else None
+            )
+            fmax = (
+                fill_max if fill_max not in (None, strawberry.UNSET)
+                else None
+            )
+
             rows = compute_aggregation(
                 qs,
                 group_by=spec,
@@ -307,11 +323,25 @@ class AggregateBuilder:
                 respect_comodel_ordering=builder.respect_comodel_ordering,
                 op_args=op_args,
                 week_start=ws,
+                fill=fill,
+                fill_min=fmin,
+                fill_max=fmax,
             )
-            total = builder._count_groups(
-                qs, spec, requested, having_dict, op_args=op_args,
-                week_start=ws,
-            )
+            if fill:
+                # Filling expands the row set with zero-count buckets,
+                # so the count optimization (DB-side ``DISTINCT``) is
+                # invalid — it would only count non-empty buckets.
+                # Recompute the total over the dense, filtered, but
+                # un-paginated row set.
+                total = builder._count_filled_groups(
+                    qs, spec, requested, having_dict, op_args=op_args,
+                    week_start=ws, fill_min=fmin, fill_max=fmax,
+                )
+            else:
+                total = builder._count_groups(
+                    qs, spec, requested, having_dict, op_args=op_args,
+                    week_start=ws,
+                )
             grouped_rows = [
                 builder._shape_grouped(
                     grouped_type, group_key_type, row, requested, spec,
@@ -340,6 +370,9 @@ class AggregateBuilder:
         )
         annotations["pagination"] = OffsetPaginationInput | None
         annotations["week_start"] = int
+        annotations["fill"]       = bool
+        annotations["fill_min"]   = datetime.datetime | None
+        annotations["fill_max"]   = datetime.datetime | None
         annotations["return"]     = grouped_result_type
 
         if filter_type is None:
@@ -351,11 +384,15 @@ class AggregateBuilder:
                 order_by:  Any = None,
                 pagination: OffsetPaginationInput | None = None,
                 week_start: int = 1,
+                fill: bool = False,
+                fill_min: datetime.datetime | None = None,
+                fill_max: datetime.datetime | None = None,
             ) -> Any:
                 return resolver(
                     info=info, group_by=group_by, filter=None,
                     having=having, order_by=order_by,
                     pagination=pagination, week_start=week_start,
+                    fill=fill, fill_min=fill_min, fill_max=fill_max,
                 )
             resolver_no_filter.__annotations__ = annotations
             return strawberry_django.field(
@@ -698,6 +735,43 @@ class AggregateBuilder:
             )
             out.append((canonical, direction, nulls))
         return out
+
+    def _count_filled_groups(
+        self,
+        qs: QuerySet,
+        spec: list[tuple[str, Any]],
+        requested: list[tuple[AggregateOp, str | None]],
+        having_dict: dict[str, Any],
+        op_args: dict[str, dict[str, Any]] | None = None,
+        week_start: int = 1,
+        fill_min: datetime.datetime | None = None,
+        fill_max: datetime.datetime | None = None,
+    ) -> int:
+        """Total bucket count after empty-bucket filling, ignoring
+        offset/limit.
+
+        The standard ``_count_groups`` path emits ``SELECT COUNT(*) FROM
+        (SELECT DISTINCT ...)`` which only sees populated buckets — it
+        would under-count when ``fill=True`` is in effect. We compute
+        the total by running the full filled aggregation (without
+        offset/limit) and taking ``len`` of the result. Cardinality is
+        bounded for analytics queries, so the cost is acceptable; if
+        this becomes a hot path in v1.x, swap in a SQL ``generate_series``
+        path that COUNTs the spine directly.
+        """
+        from strawberry_django_aggregates.compiler import compute_aggregation
+        rows = compute_aggregation(
+            qs,
+            group_by=spec,
+            aggregates=requested,
+            having=having_dict,
+            op_args=op_args or {},
+            week_start=week_start,
+            fill=True,
+            fill_min=fill_min,
+            fill_max=fill_max,
+        )
+        return len(rows)
 
     def _count_groups(
         self,

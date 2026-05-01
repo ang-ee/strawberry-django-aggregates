@@ -22,6 +22,9 @@ Public surface:
 - :class:`BucketRange` + :func:`bucket_range` — half-open ``[from, to)``
   interval emitted as a sibling on ``<Model>GroupKey`` for each
   TIME-granularity bucket (SPEC § 7).
+- :func:`generate_bucket_spine` + :func:`fill_bucket_results` —
+  empty-bucket filling helpers powering ``compute_aggregation(fill=True)``
+  (SPEC § 7.2). Pure stdlib; callable from any Python context.
 - Errors: :class:`AggregateError`, :class:`OperatorNotSupportedError`,
   :class:`OrderFieldNotAllowed`, :class:`AggregationAcrossRelationError`.
 
@@ -40,6 +43,10 @@ from strawberry_django_aggregates.errors import (
     AggregationAcrossRelationError,
     OperatorNotSupportedError,
     OrderFieldNotAllowed,
+)
+from strawberry_django_aggregates.fill import (
+    fill_bucket_results,
+    generate_bucket_spine,
 )
 from strawberry_django_aggregates.granularity import (
     NumberGranularity,
@@ -87,6 +94,10 @@ __all__ = [
     # group-by buckets (SPEC § 7 / Stream 5).
     "BucketRange",
     "bucket_range",
+    # Empty-bucket filling — dense bucket spine over date-bucketed
+    # results (SPEC § 7.2 / Stream 7).
+    "fill_bucket_results",
+    "generate_bucket_spine",
     # Ordering
     "parse_aggregate_order",
     "comodel_ordering_terms",

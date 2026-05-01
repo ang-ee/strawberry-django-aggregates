@@ -358,6 +358,9 @@ def compute_aggregation(
     week_start: int = 1,
     respect_comodel_ordering: bool = False,
     op_args:    dict[str, dict[str, Any]] | None = None,
+    fill:       bool = False,
+    fill_min:   datetime.datetime | None = None,
+    fill_max:   datetime.datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Compile a queryset into an aggregation query.
 
@@ -384,6 +387,18 @@ def compute_aggregation(
     subclass. Aliases that don't appear here fall back to operator
     defaults (currently only the percentile ops require a fraction —
     ``MODE`` and the rest take no extra args).
+
+    ``fill`` enables empty-bucket filling (SPEC § 7.2). When ``True``,
+    ``group_by`` MUST contain exactly one ``TimeGranularity`` entry —
+    multi-level group_by + fill is a v1.x feature; v1.0 raises with a
+    clear message. The result includes one row per bucket between the
+    data's min and max (or ``fill_min`` / ``fill_max`` overrides), with
+    ``count: 0`` and all other measures ``None`` for any bucket that
+    had no underlying rows. HAVING applies BEFORE filling — filtered-
+    out rows are not back-filled. ``offset`` and ``limit`` apply AFTER
+    filling. Ordering: filled rows are sorted ascending by the bucket
+    alias by default; an explicit ``order_by`` re-applies on the
+    filled list.
     """
     group_by    = group_by    or []
     aggregates  = aggregates  or []
@@ -401,6 +416,17 @@ def compute_aggregation(
             "HAVING requires a non-empty `group_by` — there is nothing "
             "to filter without group buckets. Add a `group_by` or "
             "filter on the queryset directly with `.filter(...)`."
+        )
+
+    if fill:
+        _validate_fill_spec(group_by)
+    elif fill_min is not None or fill_max is not None:
+        # ``fill_min`` / ``fill_max`` without ``fill=True`` is a usage
+        # error — the bounds have nowhere to apply. Fail loud rather
+        # than silently ignoring.
+        raise AggregateError(
+            "fill_min / fill_max require fill=True. Pass fill=True to "
+            "enable empty-bucket filling, or remove the bounds.",
         )
 
     _validate_postgres_only(aggregates, vendor)
@@ -439,14 +465,210 @@ def compute_aggregation(
     if having_q is not None:
         qs = qs.filter(having_q)
 
-    if order_terms:
+    # Apply user-supplied ordering before fill so the pre-fill rows are
+    # in the order the user asked for. Filling re-sorts ascending by
+    # the bucket alias if no explicit order_by was supplied; otherwise
+    # the explicit ordering is re-applied to the filled list at the end.
+    if order_terms and not fill:
         qs = qs.order_by(*order_terms)
 
-    if offset or limit is not None:
+    # Offset / limit BEFORE fill would defeat the dense-spine contract —
+    # the slicing would discard filler buckets. Apply AFTER fill instead.
+    if not fill and (offset or limit is not None):
         stop = (offset + limit) if limit is not None else None
         qs = qs[offset:stop]
 
-    return list(qs)
+    rows = list(qs)
+
+    if fill:
+        # Range bounds. When the caller supplies explicit ``fill_min`` /
+        # ``fill_max``, they take precedence. Otherwise we derive bounds
+        # from the POST-HAVING rows — fill operates on the data that
+        # passed HAVING, so a HAVING-filtered bucket is neither emitted
+        # nor back-filled. SPEC § 7.2 documents this ordering.
+        bucket_field = group_by[0][0] if group_by else None
+        resolved_min, resolved_max = _resolve_fill_bounds(
+            queryset, bucket_field, fill_min, fill_max,
+            post_having_rows=rows if having_q is not None else None,
+            bucket_alias=(
+                f"{bucket_field}_{group_by[0][1].value}"
+                if bucket_field is not None
+                and isinstance(group_by[0][1], TimeGranularity)
+                else None
+            ),
+        )
+        from strawberry_django_aggregates.fill import fill_bucket_results
+        # ``aggregate_annotations`` keys are the canonical aliases the
+        # rows carry. ``aggregate_alias(COUNT, None)`` resolves to
+        # ``"count"``, so the list already includes the count alias if
+        # the caller projected COUNT — which the GraphQL builder always
+        # does. Defensively fall back to a bare ``["count"]`` when the
+        # caller passed no aggregates at all (rare for the primitive,
+        # impossible from the wire).
+        agg_aliases = list(aggregate_annotations.keys()) or ["count"]
+        rows = fill_bucket_results(
+            rows,
+            group_by,
+            agg_aliases,
+            resolved_min,
+            resolved_max,
+            week_start,
+        )
+        if order_terms:
+            rows = _apply_order_to_rows(rows, order_by)
+        if offset or limit is not None:
+            stop = (offset + limit) if limit is not None else len(rows)
+            rows = rows[offset:stop]
+
+    return rows
+
+
+def _validate_fill_spec(
+    group_by: list[tuple[str, Granularity | None]],
+) -> None:
+    """Enforce the v1.0 single-TIME-granularity restriction for fill.
+
+    Raises :class:`AggregateError` when ``fill=True`` is requested with
+    a ``group_by`` shape we can't fill in v1.0:
+
+    - Empty ``group_by`` — nothing to fill.
+    - Multi-entry ``group_by`` — multi-level fill is a v1.x feature.
+    - The single entry's granularity is ``None`` or a ``NumberGranularity``
+      — fill is meaningless without contiguous bucket arithmetic.
+    """
+    if not group_by:
+        raise AggregateError(
+            "fill=True requires exactly one TIME-granularity bucket in "
+            "group_by; got an empty group_by.",
+        )
+    if len(group_by) != 1:
+        raise AggregateError(
+            "fill=True with multi-level group_by is not supported in "
+            "v1.0. Pass exactly one (field, TimeGranularity) entry. "
+            "Multi-level fill is a v1.x feature — track the SPEC § 7.2 "
+            "roadmap.",
+        )
+    field_path, granularity = group_by[0]
+    if not isinstance(granularity, TimeGranularity):
+        raise AggregateError(
+            f"fill=True requires a TimeGranularity bucket; got "
+            f"{type(granularity).__name__ if granularity else 'None'} "
+            f"on field `{field_path}`.",
+        )
+
+
+def _resolve_fill_bounds(
+    queryset: QuerySet,
+    bucket_field: str | None,
+    fill_min: datetime.datetime | None,
+    fill_max: datetime.datetime | None,
+    post_having_rows: list[dict[str, Any]] | None = None,
+    bucket_alias: str | None = None,
+) -> tuple[datetime.datetime | None, datetime.datetime | None]:
+    """Resolve the spine endpoints for empty-bucket filling.
+
+    Priority order for each endpoint independently:
+
+    1. Explicit ``fill_min`` / ``fill_max`` from the caller.
+    2. ``min`` / ``max`` of the post-HAVING result rows (when HAVING
+       was applied) — keyed off ``bucket_alias``. Mirrors the SPEC
+       § 7.2 decision: HAVING applies BEFORE fill, so a HAVING-filtered
+       bucket extends neither the data nor the spine.
+    3. ``min`` / ``max`` of the underlying queryset — issued via a
+       single ``aggregate()`` call on the same queryset the main
+       aggregation walks (already permission-scoped per CLAUDE.md
+       Critical Rule 1).
+
+    Returns ``(None, None)`` only when the queryset is empty AND no
+    explicit endpoints were given. The caller treats that as "nothing
+    to fill" and returns the rows untouched.
+    """
+    if fill_min is not None and fill_max is not None:
+        return fill_min, fill_max
+
+    # Post-HAVING bounds take precedence over raw queryset bounds.
+    post_min: datetime.datetime | None = None
+    post_max: datetime.datetime | None = None
+    if post_having_rows is not None and bucket_alias is not None:
+        bucket_values = [
+            r[bucket_alias] for r in post_having_rows
+            if isinstance(r.get(bucket_alias), datetime.datetime)
+        ]
+        if bucket_values:
+            post_min = min(bucket_values)
+            post_max = max(bucket_values)
+
+    # Fall back to the raw queryset only when post-HAVING bounds are
+    # absent. Skipping the SQL when both endpoints can be resolved from
+    # cheaper sources keeps the cost down for the common HAVING+fill
+    # case (one extra COUNT instead of one extra COUNT + one MIN/MAX).
+    raw_min: datetime.datetime | None = None
+    raw_max: datetime.datetime | None = None
+    need_raw = (
+        bucket_field is not None
+        and (
+            (fill_min is None and post_min is None)
+            or (fill_max is None and post_max is None)
+        )
+    )
+    if need_raw:
+        bounds = queryset.aggregate(
+            _fill_min=Min(bucket_field), _fill_max=Max(bucket_field),
+        )
+        raw_min = bounds.get("_fill_min")
+        raw_max = bounds.get("_fill_max")
+
+    resolved_min = (
+        fill_min if fill_min is not None
+        else post_min if post_min is not None
+        else raw_min
+    )
+    resolved_max = (
+        fill_max if fill_max is not None
+        else post_max if post_max is not None
+        else raw_max
+    )
+    return resolved_min, resolved_max
+
+
+def _apply_order_to_rows(
+    rows: list[dict[str, Any]],
+    order_by: list[tuple[str, str, str | None]],
+) -> list[dict[str, Any]]:
+    """Re-apply user ``order_by`` terms to a Python list of result rows.
+
+    Used after empty-bucket filling — the SQL ORDER BY can't reach the
+    in-memory filler rows. Each ``(alias, direction, nulls)`` triple is
+    applied via a stable sort, in reverse priority so the highest-
+    priority key wins.
+
+    ``nulls="first"`` / ``"last"`` is honoured; the default mirrors
+    SQL's ``ASC`` (nulls last) and ``DESC`` (nulls first) — same shape
+    the SQL backend would emit.
+    """
+    if not order_by:
+        return rows
+    # Stable sort applied in reverse priority order.
+    out = list(rows)
+    for alias, direction, nulls in reversed(order_by):
+        reverse = direction == "desc"
+        if nulls is None:
+            nulls_last = not reverse  # ASC → last; DESC → first
+        else:
+            nulls_last = nulls == "last"
+
+        def keyfn(
+            row: dict[str, Any],
+            _alias: str = alias,
+            _nulls_last: bool = nulls_last,
+        ) -> tuple[int, Any]:
+            v = row.get(_alias)
+            if v is None:
+                return (1 if _nulls_last else -1, v)
+            return (0, v)
+
+        out.sort(key=keyfn, reverse=reverse)
+    return out
 
 
 # ---------------------------------------------------------------------------
