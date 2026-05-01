@@ -1,0 +1,78 @@
+[project]
+name            = "strawberry-django-aggregates"
+version         = "0.1.0"
+description     = "Hasura-shape aggregations over Django querysets in Strawberry GraphQL — count, sum, avg, min, max, stddev, variance, array_agg + Odoo-grade group-by with timezone-correct date bucketing."
+readme          = "README.md"
+requires-python = ">=3.13"
+license         = { text = "BSD-3-Clause" }
+authors         = [{ name = "strawberry-django-aggregates maintainers" }]
+keywords        = [
+  "django", "strawberry", "graphql", "aggregate", "groupby",
+  "hasura", "postgraphile", "odoo", "analytics",
+]
+classifiers     = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: Django",
+  "Framework :: Django :: 5.0",
+  "Framework :: Django :: 5.1",
+  "Framework :: Django :: 5.2",
+  "Framework :: Django :: 6.0",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: BSD License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database",
+  "Topic :: Internet :: WWW/HTTP",
+  "Typing :: Typed",
+]
+
+dependencies = [
+  "django>=5.0",
+  "strawberry-graphql>=0.315.0",
+  "strawberry-graphql-django>=0.82.0",
+]
+
+[project.optional-dependencies]
+# Postgres-only operators (array_agg, string_agg, stddev, variance).
+# When this extra is NOT installed, those operators raise OperatorNotSupportedError
+# at resolver entry on non-Postgres connections.
+postgres = []
+
+[project.urls]
+Homepage      = "https://github.com/Apexive/strawberry-django-aggregates"
+Documentation = "https://github.com/Apexive/strawberry-django-aggregates/blob/main/docs/SPEC.md"
+Issues        = "https://github.com/Apexive/strawberry-django-aggregates/issues"
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-django>=4",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "django-stubs>=5",
+]
+
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["strawberry_django_aggregates*"]
+exclude = ["tests*", "docs*"]
+
+[tool.ruff]
+line-length    = 79
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "settings"
+python_files           = ["test_*.py"]
+testpaths              = ["tests"]
+addopts                = "-ra --strict-markers"
+pythonpath             = ["tests"]
