@@ -73,6 +73,18 @@ def _to_camel(snake: str) -> str:
     return head + "".join(w.capitalize() for w in tail)
 
 
+def _to_camel_alias(snake: str) -> str:
+    """Mirror Strawberry's :func:`to_camel_case` for double-underscore
+    aliases. ``"metadata__amount"`` → ``"metadata_Amount"``.
+
+    Strawberry preserves the double-underscore segment as a single
+    underscore + capitalized tail, distinguishing the JSON-path alias
+    form from a regular ``metadata_amount`` (→ ``metadataAmount``).
+    """
+    from strawberry.utils.str_converters import to_camel_case
+    return to_camel_case(snake)
+
+
 # GraphQL camelCase wire-name → AggregateOp. Used by the resolver to
 # walk ``info.selected_fields`` and figure out which (op, field) pairs
 # to ask the compiler for.
@@ -165,6 +177,13 @@ class AggregateBuilder:
     get_queryset:     Callable[[Any], QuerySet] | None = None
     respect_comodel_ordering: bool = False
     pagination_style: Literal["offset", "cursor", "both"] = "offset"
+    # JSON-path allowlist (SPEC § 6.1). Keys are dotted wire paths
+    # (``metadata.region``); values are declared-type tokens
+    # (``"str"`` / ``"int"`` / ``"float"`` / ``"Decimal"`` / ``"bool"``
+    # / ``"date"`` / ``"datetime"``). Permission-naive — the same path
+    # is exposed to every caller; row-level scoping is the queryset's
+    # job per CLAUDE.md Critical Rule 1.
+    json_paths:       dict[str, str] | None = None
 
     def build(self) -> BuiltAggregates:
         """Generate all types and return them along with attached fields."""
@@ -176,6 +195,7 @@ class AggregateBuilder:
             aggregate_fields=self.aggregate_fields,
             operators=self.operators,
             enable_federation=self.enable_federation,
+            json_paths=self.json_paths,
         )
         having_input = make_having_input(
             self.model,
@@ -183,12 +203,14 @@ class AggregateBuilder:
             aggregate_fields=self.aggregate_fields,
             operators=self.operators,
             enable_federation=self.enable_federation,
+            json_paths=self.json_paths,
         )
         group_by_spec, groupable_field_enum = make_group_by_spec(
             self.model,
             name=name,
             group_by_fields=self.group_by_fields,
             enable_federation=self.enable_federation,
+            json_paths=self.json_paths,
         )
         group_key_type, grouped_type, grouped_result_type = (
             make_grouped_type(
@@ -199,6 +221,7 @@ class AggregateBuilder:
                 group_by_fields=self.group_by_fields,
                 operators=self.operators,
                 enable_federation=self.enable_federation,
+                json_paths=self.json_paths,
             )
         )
         group_order_input = make_group_order_input(
@@ -293,7 +316,10 @@ class AggregateBuilder:
                 info, a_fields, op_args=op_args,
             )
             rows = compute_aggregation(
-                qs, aggregates=requested, op_args=op_args,
+                qs,
+                aggregates=requested,
+                op_args=op_args,
+                json_paths=builder.json_paths,
             )
             row = rows[0] if rows else {}
             return builder._shape_aggregate(
@@ -398,6 +424,7 @@ class AggregateBuilder:
                 fill=fill,
                 fill_min=fmin,
                 fill_max=fmax,
+                json_paths=builder.json_paths,
             )
             if fill:
                 # Filling expands the row set with zero-count buckets,
@@ -746,8 +773,15 @@ class AggregateBuilder:
         )
         out: list[Any] = []
         for fp, grain in spec:
-            field = self.model._meta.get_field(fp)
-            alias = _gba(fp, grain, field)  # type: ignore[arg-type]
+            if self.json_paths and fp in self.json_paths:
+                base_alias = fp.replace(".", "__")
+                alias = (
+                    f"{base_alias}_{grain.value}" if grain is not None
+                    else base_alias
+                )
+            else:
+                field = self.model._meta.get_field(fp)
+                alias = _gba(fp, grain, field)  # type: ignore[arg-type]
             out.append(row.get(alias))
         return out
 
@@ -793,10 +827,10 @@ class AggregateBuilder:
         tzinfo = _resolve_tzinfo(settings.TIME_ZONE)
 
         group_ann, group_aliases = _build_group_by_annotations(
-            qs.model, spec, tzinfo, week_start,
+            qs.model, spec, tzinfo, week_start, self.json_paths,
         )
         agg_ann = _build_aggregate_annotations(
-            qs.model, requested, vendor, op_args or {},
+            qs.model, requested, vendor, op_args or {}, self.json_paths,
         )
 
         cqs = qs
@@ -865,7 +899,13 @@ class AggregateBuilder:
         from strawberry_django_aggregates.types import (
             _resolve_aggregate_fields,
         )
-        return _resolve_aggregate_fields(self.model, self.aggregate_fields)
+        # Returns the dotted-form JSON paths verbatim (for the compiler)
+        # alongside regular Field names. The wire-side field-name match
+        # against this list is done after :meth:`_dotted_to_json_alias`-
+        # like normalization in :meth:`_extract_ops_from_grouped`.
+        return _resolve_aggregate_fields(
+            self.model, self.aggregate_fields, self.json_paths,
+        )
 
     def _requested_aggregate_ops(
         self, info: Any, a_fields: list[str],
@@ -1047,8 +1087,16 @@ class AggregateBuilder:
                 continue
             for f in self._flatten_selections(inner):
                 fname = getattr(f, "name", None)
+                if fname is None:
+                    continue
                 if fname in a_fields:
                     yield (op, fname)
+                    continue
+                # JSON-path alias (``metadata__amount``) — translate
+                # back to the dotted form the compiler expects.
+                dotted = self._json_alias_to_dotted(fname)
+                if dotted != fname and dotted in a_fields:
+                    yield (op, dotted)
 
     def _countable_field_to_path(self, arg: Any) -> str | None:
         """Resolve a ``CountableField`` argument to a model field name.
@@ -1074,6 +1122,12 @@ class AggregateBuilder:
             field_name = (
                 s.field.value if hasattr(s.field, "value") else s.field
             )
+            # Reverse the alias-form → dotted JSON-path mapping. Wire
+            # carries ``metadata__region`` (Django alias form, GraphQL-
+            # safe enum naming); compiler expects ``metadata.region``
+            # (dotted) so :func:`_resolve_json_path` can detect the
+            # JSON-path branch.
+            field_name = self._json_alias_to_dotted(field_name)
             grain = s.granularity
             if grain is None:
                 out.append((field_name, None))
@@ -1082,6 +1136,35 @@ class AggregateBuilder:
             granularity = _resolve_granularity(grain_value)
             out.append((field_name, granularity))
         return out
+
+    def _json_alias_to_dotted(self, name: str) -> str:
+        """Translate a wire-side JSON-path alias back to dotted form.
+
+        Accepts BOTH ``"metadata__region"`` (Python alias / enum value)
+        and ``"metadata_Region"`` (Strawberry's GraphQL wire-name
+        camelCasing of the same Python attribute) and maps either to
+        ``"metadata.region"`` *iff* ``metadata.region`` was declared
+        in :attr:`json_paths`. Names that don't match any declared
+        JSON path are returned verbatim — the wire form is itself a
+        valid Django field name for non-JSON paths.
+
+        Two forms reach this helper because Strawberry generates the
+        GraphQL field name by camelCasing the Python identifier
+        (``metadata__amount`` → ``metadata_Amount``) for sum-fields
+        nested types, while group_by enum values keep the underscore
+        form (``METADATA__AMOUNT``). Both forms must round-trip back
+        to the dotted form so the compiler routes through
+        :func:`_resolve_json_path`.
+        """
+        if not self.json_paths:
+            return name
+        for dotted in self.json_paths:
+            alias = dotted.replace(".", "__")
+            if alias == name:
+                return dotted
+            if _to_camel_alias(alias) == name:
+                return dotted
+        return name
 
     def _translate_having(
         self, having: Any | None,
@@ -1109,6 +1192,17 @@ class AggregateBuilder:
                 continue
             measure, comparison = _split_having_input_field(f.name)
             op, field_path = _measure_to_op_field(measure)
+            # The HAVING measure carries the alias form for JSON paths
+            # (``sum_metadata__amount``); translate ``metadata__amount``
+            # back to the dotted ``metadata.amount`` so the auto-extended
+            # ``requested`` entry routes through the JSON-path branch in
+            # the compiler. The ``measure`` string itself stays in alias
+            # form because it must match the SQL alias the compiler
+            # emits for that measure.
+            if field_path is not None:
+                dotted = self._json_alias_to_dotted(field_path)
+                if dotted != field_path:
+                    field_path = dotted
             if (op, field_path) not in seen:
                 requested.append((op, field_path))
                 seen.add((op, field_path))
@@ -1123,11 +1217,32 @@ class AggregateBuilder:
     ) -> list[tuple[str, str, str | None]]:
         if not order_by:
             return []
-        group_aliases = [
-            group_by_alias(fp, gr, None) for fp, gr in spec
+        # Mirror :meth:`_shape_grouped`'s alias derivation: JSON-path
+        # entries use the alias-form name (``metadata__region``) plus
+        # any granularity suffix; regular fields delegate to the
+        # standard :func:`group_by_alias` helper.
+        group_aliases: list[str] = []
+        for fp, gr in spec:
+            if self.json_paths and fp in self.json_paths:
+                base_alias = fp.replace(".", "__")
+                if gr is not None:
+                    group_aliases.append(f"{base_alias}_{gr.value}")
+                else:
+                    group_aliases.append(base_alias)
+            else:
+                group_aliases.append(group_by_alias(fp, gr, None))
+        # Translate requested aggregate ``(op, dotted)`` entries into the
+        # alias-form ``(op, metadata__amount)`` so that
+        # :func:`aggregate_aliases_from_spec` produces aliases matching
+        # the SQL we actually annotated.
+        requested_for_aliases: list[tuple[AggregateOp | str, str | None]] = [
+            (op, fp.replace(".", "__"))
+            if (fp is not None and self.json_paths and fp in self.json_paths)
+            else (op, fp)
+            for op, fp in requested
         ]
         agg_aliases = aggregate_aliases_from_spec(
-            [(op, fp) for op, fp in requested],
+            requested_for_aliases,
         )
         out: list[tuple[str, str, str | None]] = []
         for o in order_by:
@@ -1205,6 +1320,7 @@ class AggregateBuilder:
             fill=True,
             fill_min=fill_min,
             fill_max=fill_max,
+            json_paths=self.json_paths,
         )
         return len(rows)
 
@@ -1251,7 +1367,7 @@ class AggregateBuilder:
         vendor = connections[qs.db].vendor
         tzinfo = _resolve_tzinfo(settings.TIME_ZONE)
         group_ann, group_aliases = _build_group_by_annotations(
-            qs.model, spec, tzinfo, week_start,
+            qs.model, spec, tzinfo, week_start, self.json_paths,
         )
 
         if not having_dict:
@@ -1261,7 +1377,7 @@ class AggregateBuilder:
             return cqs.values(*group_aliases).distinct().count()
 
         agg_ann = _build_aggregate_annotations(
-            qs.model, requested, vendor, op_args or {},
+            qs.model, requested, vendor, op_args or {}, self.json_paths,
         )
         cqs = qs
         if group_ann:
@@ -1311,10 +1427,23 @@ class AggregateBuilder:
     ) -> Any:
         key_kwargs: dict[str, Any] = {}
         for fp, grain in spec:
-            field = self.model._meta.get_field(fp)
-            alias = group_by_alias(
-                fp, grain, field,  # type: ignore[arg-type]
-            )
+            # JSON-path entries: alias derives from the dotted form
+            # (``metadata.region`` → ``metadata__region``) plus any
+            # granularity suffix. We do NOT call ``group_by_alias`` —
+            # that helper inspects the Django Field metadata to pick
+            # ``customer_id`` vs ``customer``, which has no parallel
+            # for synthetic JSON-path columns.
+            if self.json_paths and fp in self.json_paths:
+                base_alias = fp.replace(".", "__")
+                if grain is not None:
+                    alias = f"{base_alias}_{grain.value}"
+                else:
+                    alias = base_alias
+            else:
+                field = self.model._meta.get_field(fp)
+                alias = group_by_alias(
+                    fp, grain, field,  # type: ignore[arg-type]
+                )
             value = row.get(alias)
             key_kwargs[alias] = value
             # TIME granularity: emit the half-open ``[from, to)``
@@ -1435,7 +1564,11 @@ class AggregateBuilder:
         backing dicts on the instance, not the dataclass field map —
         and are skipped here.
         """
-        # Group requested aggregates by op.
+        # Group requested aggregates by op. JSON-path fields use the
+        # alias-form name (``metadata__amount``) on the dataclass and
+        # in the row dict; the ``requested`` list carries the dotted
+        # form (``metadata.amount``) so the compiler can detect JSON
+        # paths. Translate here for both purposes.
         by_op: dict[AggregateOp, dict[str, Any]] = {}
         for op, fp in requested:
             if op in {
@@ -1447,7 +1580,13 @@ class AggregateBuilder:
             }:
                 continue
             assert fp is not None
-            by_op.setdefault(op, {})[fp] = row.get(f"{op.value}_{fp}")
+            if self.json_paths and fp in self.json_paths:
+                emit_fp = fp.replace(".", "__")
+            else:
+                emit_fp = fp
+            by_op.setdefault(op, {})[emit_fp] = row.get(
+                f"{op.value}_{emit_fp}",
+            )
 
         out: dict[str, Any] = {}
         for op, fields_dict in by_op.items():

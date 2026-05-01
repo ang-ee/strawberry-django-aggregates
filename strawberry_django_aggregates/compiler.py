@@ -29,11 +29,13 @@ from django.db.models import (
     Count,
     DateField,
     DateTimeField,
+    DecimalField,
     ExpressionWrapper,
     F,
     FloatField,
     Func,
     IntegerField,
+    JSONField,
     Max,
     Min,
     Q,
@@ -43,7 +45,7 @@ from django.db.models import (
     Value,
     Variance,
 )
-from django.db.models.functions import Coalesce, Concat, Extract, Trunc
+from django.db.models.functions import Cast, Coalesce, Concat, Extract, Trunc
 from django.db.models.functions.datetime import TimezoneMixin
 
 from strawberry_django_aggregates.errors import (
@@ -52,6 +54,7 @@ from strawberry_django_aggregates.errors import (
     GranularityNotApplicable,
     GroupByFieldNotAllowed,
     HavingFieldNotAllowed,
+    JSONPathNotAllowed,
     OperatorNotSupportedError,
     OrderFieldNotAllowed,
 )
@@ -361,6 +364,7 @@ def compute_aggregation(
     fill:       bool = False,
     fill_min:   datetime.datetime | None = None,
     fill_max:   datetime.datetime | None = None,
+    json_paths: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Compile a queryset into an aggregation query.
 
@@ -432,11 +436,11 @@ def compute_aggregation(
     _validate_postgres_only(aggregates, vendor)
 
     group_annotations, group_aliases = _build_group_by_annotations(
-        model, group_by, tzinfo, week_start,
+        model, group_by, tzinfo, week_start, json_paths,
     )
 
     aggregate_annotations = _build_aggregate_annotations(
-        model, aggregates, vendor, op_args,
+        model, aggregates, vendor, op_args, json_paths,
     )
 
     having_q = _build_having_q(having, aggregate_annotations.keys())
@@ -709,6 +713,11 @@ def _resolve_field(
 ) -> Field:
     """Resolve a *single-segment* field name. Raises if it traverses a
     relation (``__`` in path) or is not an attribute of the model.
+
+    Dotted paths (``metadata.region``) are NOT resolved here — they are
+    handled by :func:`_resolve_json_path` upstream. By the time control
+    reaches this helper, the path is expected to be a single-segment
+    field name.
     """
     if "__" in field_path:
         raise AggregationAcrossRelationError(
@@ -725,6 +734,175 @@ def _resolve_field(
         ) from exc
 
 
+# ---------------------------------------------------------------------------
+# JSON path resolution — Stream 17.
+# ---------------------------------------------------------------------------
+#
+# Wire format: dotted path (``metadata.region``).
+# Allowlist:    ``json_paths={"metadata.region": "str", ...}``.
+# Alias form:   double-underscore (``metadata__region``) — Django convention.
+#
+# The library deliberately does NOT auto-discover JSON keys: every
+# requested path must appear in the caller-supplied allowlist with a
+# declared Python type. Without an explicit type the compiler can't pick
+# the right ``Cast`` output_field, and the SDL emitter can't pick the
+# right Strawberry scalar. See SPEC § 6.1.
+
+# Wire token → Django output_field for the Cast() wrap.
+_JSON_TYPE_TO_OUTPUT_FIELD: dict[str, Any] = {
+    "int":      IntegerField,
+    "float":    FloatField,
+    "Decimal":  DecimalField,
+    "bool":     BooleanField,
+    "date":     DateField,
+    "datetime": DateTimeField,
+}
+
+
+def _is_json_field(field: Any) -> bool:
+    """Return ``True`` when ``field`` is a Django ``JSONField`` instance.
+
+    JSONB (Postgres) and the Django-built-in JSONField both subclass
+    ``django.db.models.JSONField``; the test is structural, not
+    vendor-specific.
+    """
+    return isinstance(field, JSONField)
+
+
+def _is_dotted_json_path(model: Any, field_path: str) -> bool:
+    """Cheap pre-check: does ``field_path`` look like a dotted JSON path
+    whose first segment is a JSONField on ``model``?
+
+    Used by :func:`_resolve_field`-aware call sites to decide whether to
+    delegate to :func:`_resolve_json_path` before the standard
+    single-segment resolution.
+    """
+    if "." not in field_path:
+        return False
+    first, _ = field_path.split(".", 1)
+    try:
+        field = model._meta.get_field(first)
+    except Exception:  # field doesn't exist — let the regular path raise
+        return False
+    return _is_json_field(field)
+
+
+def json_path_alias(field_path: str) -> str:
+    """Convert a dotted JSON path to its Django-friendly alias.
+
+    ``"metadata.region"`` → ``"metadata__region"``. Used as the kwarg
+    name when annotating, the ``.values()`` argument when grouping, and
+    the column name in the result row dict.
+
+    The double-underscore separator matches Django's own convention for
+    relation traversal aliases (``customer__name``); the alias never
+    triggers Django's relation walker because it appears as an
+    annotation kwarg, not as a path on a queryset's ``.filter`` /
+    ``.values``.
+    """
+    return field_path.replace(".", "__")
+
+
+def _resolve_json_path(
+    model: Any,
+    field_path: str,
+    json_paths: dict[str, str] | None,
+) -> tuple[str, str, Any] | None:
+    """Resolve a dotted JSON path to ``(alias, declared_type, expression)``.
+
+    Returns ``None`` when ``field_path`` is not a dotted path or its
+    first segment is not a ``JSONField`` — caller falls back to the
+    regular single-segment resolution.
+
+    Raises :class:`JSONPathNotAllowed` when the first segment IS a
+    ``JSONField`` but ``field_path`` is missing from the allowlist
+    (or the allowlist is unset). Mirrors the fail-loud semantics of
+    :class:`GroupByFieldNotAllowed`.
+
+    The returned ORM ``expression`` is:
+
+    - ``KeyTextTransform("region", "metadata")`` for ``"str"`` —
+      JSONB stores text natively; no Cast needed and skipping the Cast
+      keeps SQLite-emulated JSONB happy too.
+    - ``Cast(KeyTextTransform("region", "metadata"),
+      output_field=<DjangoField>())`` for the typed paths. Cast wraps
+      ``KeyTextTransform`` (not ``KeyTransform``) so the value is read
+      out as text first and then cast to the declared type — uniform
+      behaviour across Postgres JSONB and the SQLite emulation, and
+      avoids JSONB's own type-juggling quirks (e.g. boolean ``true``
+      coming out as a JSON boolean rather than a SQL boolean).
+    """
+    if "." not in field_path:
+        return None
+    first, rest = field_path.split(".", 1)
+    if "." in rest:
+        # Multi-level nesting (``metadata.address.city``) is intentionally
+        # out of scope for v1.0 — declared-type wiring becomes ambiguous
+        # and the SQL emission needs nested KeyTransform chains. Refuse
+        # explicitly so the caller doesn't get a silent miss.
+        raise JSONPathNotAllowed(
+            f"JSON path `{field_path}` has more than one level of "
+            f"nesting. Multi-level nested JSON paths are not supported "
+            f"in v1.0; flatten the key or query the column directly.",
+        )
+    try:
+        first_field = model._meta.get_field(first)
+    except Exception:
+        return None
+    if not _is_json_field(first_field):
+        return None
+
+    if not json_paths or field_path not in json_paths:
+        raise JSONPathNotAllowed(
+            f"JSON path `{field_path}` on `{model.__name__}` is not in "
+            f"the `json_paths` allowlist. Declare it explicitly, e.g. "
+            f"`json_paths={{'{field_path}': 'str'}}`.",
+        )
+
+    declared_type = json_paths[field_path]
+    alias = json_path_alias(field_path)
+    expression = _build_json_path_expression(
+        parent=first, key=rest, declared_type=declared_type,
+    )
+    return alias, declared_type, expression
+
+
+def _build_json_path_expression(
+    *, parent: str, key: str, declared_type: str,
+) -> Any:
+    """Build the Django ORM expression that reads ``parent[key]`` and
+    casts it to ``declared_type``.
+
+    ``"str"`` returns ``KeyTextTransform`` directly (JSONB text path).
+    Other types wrap in ``Cast(..., output_field=<DjangoField>())``.
+    """
+    # Local import — :mod:`django.db.models.fields.json` is a private
+    # but stable Django path used widely in the wild for this exact
+    # purpose; importing inside the helper keeps the module-level
+    # imports lean.
+    from django.db.models.fields.json import KeyTextTransform
+    text = KeyTextTransform(key, parent)
+    if declared_type == "str":
+        return text
+    output_field_cls = _JSON_TYPE_TO_OUTPUT_FIELD.get(declared_type)
+    if output_field_cls is None:
+        raise JSONPathNotAllowed(
+            f"Unknown declared type {declared_type!r} for JSON path "
+            f"`{parent}.{key}`. Allowed: "
+            f"{sorted(_JSON_TYPE_TO_OUTPUT_FIELD)} + 'str'.",
+        )
+    if declared_type == "Decimal":
+        # Django's DecimalField requires max_digits and decimal_places
+        # at the field-instance level; JSONB stores arbitrary-precision
+        # decimals, so we pick generous defaults that fit any value the
+        # database can carry. Callers needing strict precision should
+        # pre-Cast in their queryset before calling.
+        output_field = output_field_cls(max_digits=38, decimal_places=10)
+    else:
+        output_field = output_field_cls()
+    return Cast(text, output_field=output_field)
+
+
 def _is_relation_to_many(field: Field) -> bool:
     return bool(getattr(field, "one_to_many", False)
                 or getattr(field, "many_to_many", False))
@@ -739,6 +917,7 @@ def _build_group_by_annotations(
     group_by: list[tuple[str, Granularity | None]],
     tzinfo: ZoneInfo,
     week_start: int = 1,
+    json_paths: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Build the ``.annotate()`` kwargs that materialize each group_by
     spec, plus the canonical alias list to feed into ``.values()``.
@@ -748,11 +927,39 @@ def _build_group_by_annotations(
     (e.g. annotating ``customer_id`` on a model with a ``customer``
     FK). They go straight into ``.values(attname)`` and Django emits
     them as a GROUP BY column.
+
+    JSON-path entries (``metadata.region``) ARE always annotated, even
+    without a granularity — the alias name (``metadata__region``) is
+    a synthetic Django column and the cast wrap must be applied via
+    ``.annotate()`` for the GROUP BY clause to reference the cast,
+    not the raw JSONB value.
     """
     annotations: dict[str, Any] = {}
     aliases:     list[str]      = []
 
     for field_path, granularity in group_by:
+        json = _resolve_json_path(model, field_path, json_paths)
+        if json is not None:
+            alias, declared_type, expression = json
+            if granularity is not None:
+                if declared_type not in {"date", "datetime"}:
+                    raise GranularityNotApplicable(
+                        f"Granularity {granularity!r} cannot apply to "
+                        f"JSON path `{field_path}` declared as "
+                        f"{declared_type!r}; granularity is only "
+                        f"meaningful on `date` / `datetime` paths.",
+                    )
+                bucket_alias = f"{alias}_{granularity.value}"
+                annotations[bucket_alias] = _build_json_group_by_expression(
+                    expression, granularity, declared_type,
+                    tzinfo, week_start,
+                )
+                aliases.append(bucket_alias)
+            else:
+                annotations[alias] = expression
+                aliases.append(alias)
+            continue
+
         field = _resolve_field(model, field_path, GroupByFieldNotAllowed)
         if _is_relation_to_many(field):
             raise AggregationAcrossRelationError(
@@ -767,6 +974,65 @@ def _build_group_by_annotations(
         aliases.append(alias)
 
     return annotations, aliases
+
+
+def _build_json_group_by_expression(
+    base_expression: Any,
+    granularity: Granularity,
+    declared_type: str,
+    tzinfo: ZoneInfo,
+    week_start: int = 1,
+) -> Any:
+    """Build the bucketed expression for a date-typed JSON-path group_by.
+
+    ``base_expression`` is the ``Cast(KeyTextTransform(...))`` wrap
+    produced by :func:`_build_json_path_expression`. We layer
+    ``Trunc`` / ``Extract`` on top of it the same way the Field-based
+    path does in :func:`_build_group_by_expression`.
+
+    The ``tzinfo`` keyword is passed only for ``datetime`` — ``date``
+    is timezone-naive by definition and Django's ``Trunc`` / ``Extract``
+    raise on ``tzinfo`` against a date-typed expression.
+    """
+    is_dt = declared_type == "datetime"
+    tz_kw: dict[str, Any] = {"tzinfo": tzinfo} if is_dt else {}
+
+    if isinstance(granularity, TimeGranularity):
+        if granularity is TimeGranularity.WEEK:
+            offset = (8 - week_start) % 7
+            if offset == 0:
+                return Trunc(base_expression, "week", **tz_kw)
+            delta = datetime.timedelta(days=offset)
+            out_field: Any = (
+                DateTimeField() if is_dt else DateField()
+            )
+            shifted_in = ExpressionWrapper(
+                base_expression + delta, output_field=out_field,
+            )
+            truncated = Trunc(shifted_in, "week", **tz_kw)
+            return ExpressionWrapper(
+                truncated - delta, output_field=out_field,
+            )
+        return Trunc(base_expression, granularity.value, **tz_kw)
+
+    if isinstance(granularity, NumberGranularity):
+        if granularity is NumberGranularity.DAY_OF_YEAR:
+            return _ExtractDayOfYear(base_expression, **tz_kw)
+        if granularity is NumberGranularity.DAY_OF_WEEK:
+            base = Extract(base_expression, "iso_week_day", **tz_kw)
+            if week_start == 1:
+                return base
+            return ExpressionWrapper(
+                ((base - Value(week_start) + Value(7)) % Value(7)) + Value(1),
+                output_field=IntegerField(),
+            )
+        return Extract(
+            base_expression, _NUMBER_LOOKUP[granularity], **tz_kw,
+        )
+
+    raise GranularityNotApplicable(  # defensive
+        f"Unknown granularity {granularity!r}.",
+    )
 
 
 def group_by_alias(
@@ -920,22 +1186,33 @@ def _build_aggregate_annotations(
     aggregates: list[tuple[AggregateOp, str | None]],
     vendor: str,
     op_args: dict[str, dict[str, Any]],
+    json_paths: dict[str, str] | None = None,
 ) -> dict[str, Aggregate]:
     annotations: dict[str, Aggregate] = {}
     for op, field_path in aggregates:
         field: Field | None
+        json_expression: Any = None
         if op is AggregateOp.COUNT_DISTINCT_TUPLE:
             # Multi-segment path encoded as ``a__b__c`` — validate each
             # segment as a single-field name on the model. The
             # COUNT_DISTINCT_TUPLE branch in
             # :func:`_build_aggregate_expression` operates on the raw
-            # segment list, not on a single Field.
+            # segment list, not on a single Field. JSON-path tuples are
+            # not supported in v1.0 (each segment must be a real field
+            # name); the dotted-path detector therefore is not run here.
             assert field_path is not None
             for segment in field_path.split("__"):
                 _resolve_field(model, segment, GroupByFieldNotAllowed)
             field = None
         elif field_path is not None:
-            field = _resolve_field(model, field_path, GroupByFieldNotAllowed)
+            json = _resolve_json_path(model, field_path, json_paths)
+            if json is not None:
+                _, _, json_expression = json
+                field = None
+            else:
+                field = _resolve_field(
+                    model, field_path, GroupByFieldNotAllowed,
+                )
         else:
             field = None
         extra: dict[str, Any] = {}
@@ -943,9 +1220,20 @@ def _build_aggregate_annotations(
             assert field_path is not None
             fraction = _require_fraction(op_args, op, field_path)
             extra["fraction"] = fraction
-        alias = aggregate_alias(op, field_path, **extra)
+        # Aliases for JSON paths use the double-underscore form so the
+        # resulting column name matches the rest of the toolchain
+        # (``sum_metadata__amount`` etc.). The aggregate_alias helper
+        # already preserves the input ``field_path`` verbatim — we just
+        # rewrite the dotted form to the underscore form here.
+        alias_field_path = (
+            json_path_alias(field_path)
+            if (field_path is not None and json_expression is not None)
+            else field_path
+        )
+        alias = aggregate_alias(op, alias_field_path, **extra)
         annotations[alias] = _build_aggregate_expression(
             op, field_path, vendor, field, extra,
+            json_expression=json_expression,
         )
     return annotations
 
@@ -1043,41 +1331,55 @@ def _build_aggregate_expression(
     vendor: str,
     field: Field | None = None,
     extra: dict[str, Any] | None = None,
+    json_expression: Any = None,
 ) -> Aggregate:
+    """Build the Django ``Aggregate`` for ``(op, field_path)``.
+
+    When ``json_expression`` is provided, the aggregate operates on
+    that ORM expression (a ``Cast(KeyTextTransform(...))`` or bare
+    ``KeyTextTransform`` from :func:`_build_json_path_expression`)
+    rather than the raw ``field_path`` string.
+    """
     extra = extra or {}
+    # When a JSON-path expression is supplied, the aggregate's input
+    # is the cast expression itself; otherwise we pass ``field_path``
+    # so Django resolves it as a column reference.
+    aggregate_input: Any = (
+        json_expression if json_expression is not None else field_path
+    )
     if op is AggregateOp.COUNT:
         return Count("pk")
     if op is AggregateOp.COUNT_DISTINCT:
-        assert field_path is not None
-        return Count(field_path, distinct=True)
+        assert aggregate_input is not None
+        return Count(aggregate_input, distinct=True)
     if op is AggregateOp.COUNT_DISTINCT_TUPLE:
         assert field_path is not None
         segments = field_path.split("__")
         return _build_count_distinct_tuple(segments, vendor)
     if op is AggregateOp.SUM:
-        return Sum(field_path)  # type: ignore[arg-type]
+        return Sum(aggregate_input)  # type: ignore[arg-type]
     if op is AggregateOp.AVG:
-        return Avg(field_path)  # type: ignore[arg-type]
+        return Avg(aggregate_input)  # type: ignore[arg-type]
     if op is AggregateOp.MIN:
-        return Min(field_path)  # type: ignore[arg-type]
+        return Min(aggregate_input)  # type: ignore[arg-type]
     if op is AggregateOp.MAX:
-        return Max(field_path)  # type: ignore[arg-type]
+        return Max(aggregate_input)  # type: ignore[arg-type]
     if op is AggregateOp.STDDEV:
-        return StdDev(field_path, sample=True)  # type: ignore[arg-type]
+        return StdDev(aggregate_input, sample=True)  # type: ignore[arg-type]
     if op is AggregateOp.VARIANCE:
-        return Variance(field_path, sample=True)  # type: ignore[arg-type]
+        return Variance(aggregate_input, sample=True)  # type: ignore[arg-type]
     if op is AggregateOp.STDDEV_POP:
-        return StdDev(field_path, sample=False)  # type: ignore[arg-type]
+        return StdDev(aggregate_input, sample=False)  # type: ignore[arg-type]
     if op is AggregateOp.VAR_POP:
-        return Variance(field_path, sample=False)  # type: ignore[arg-type]
+        return Variance(aggregate_input, sample=False)  # type: ignore[arg-type]
     if op is AggregateOp.PERCENTILE_CONT:
-        assert field_path is not None
-        return _PercentileCont(field_path, fraction=extra["fraction"])
+        assert aggregate_input is not None
+        return _PercentileCont(aggregate_input, fraction=extra["fraction"])
     if op is AggregateOp.PERCENTILE_DISC:
-        assert field_path is not None
-        return _PercentileDisc(field_path, fraction=extra["fraction"])
+        assert aggregate_input is not None
+        return _PercentileDisc(aggregate_input, fraction=extra["fraction"])
     if op is AggregateOp.MODE:
-        assert field_path is not None
+        assert aggregate_input is not None
         # Match the source field's natural output type so MODE over a
         # CharField returns String, MODE over a DateField returns Date,
         # etc. ``_output_field_or_none`` is Django's documented hook.
@@ -1087,33 +1389,33 @@ def _build_aggregate_expression(
             of_value = of() if callable(of) else None
             if of_value is not None:
                 kwargs["output_field"] = of_value
-        return _Mode(field_path, **kwargs)
+        return _Mode(aggregate_input, **kwargs)
     if op is AggregateOp.BOOL_AND:
-        return _bool_and(field_path, vendor)
+        return _bool_and(aggregate_input, vendor)
     if op is AggregateOp.BOOL_OR:
-        return _bool_or(field_path, vendor)
+        return _bool_or(aggregate_input, vendor)
     if op is AggregateOp.ARRAY_AGG:
         from django.contrib.postgres.aggregates import ArrayAgg
-        return ArrayAgg(field_path)  # type: ignore[arg-type]
+        return ArrayAgg(aggregate_input)  # type: ignore[arg-type]
     if op is AggregateOp.STRING_AGG:
         from django.contrib.postgres.aggregates import StringAgg
-        return StringAgg(field_path, delimiter=",")  # type: ignore[arg-type]
+        return StringAgg(aggregate_input, delimiter=",")  # type: ignore[arg-type]
     raise ValueError(f"Unknown aggregate operator {op!r}")  # defensive
 
 
-def _bool_and(field_path: str | None, vendor: str) -> Aggregate:
+def _bool_and(aggregate_input: Any, vendor: str) -> Aggregate:
     if vendor == "postgresql":
         from django.contrib.postgres.aggregates import BoolAnd
-        return BoolAnd(field_path)
+        return BoolAnd(aggregate_input)
     # SQLite emulation: MIN(bool) is False if any False, True if all True.
-    return Min(field_path, output_field=BooleanField())  # type: ignore[arg-type]
+    return Min(aggregate_input, output_field=BooleanField())  # type: ignore[arg-type]
 
 
-def _bool_or(field_path: str | None, vendor: str) -> Aggregate:
+def _bool_or(aggregate_input: Any, vendor: str) -> Aggregate:
     if vendor == "postgresql":
         from django.contrib.postgres.aggregates import BoolOr
-        return BoolOr(field_path)
-    return Max(field_path, output_field=BooleanField())  # type: ignore[arg-type]
+        return BoolOr(aggregate_input)
+    return Max(aggregate_input, output_field=BooleanField())  # type: ignore[arg-type]
 
 
 # Sentinel used in the SQLite emulation of multi-column COUNT(DISTINCT).

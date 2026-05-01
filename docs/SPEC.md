@@ -305,6 +305,10 @@ Field types map to default operator allowlists. Consumers can narrow further via
 
 `count` and `count_distinct` are always present at the type level (operate on rows, not on a measure).
 
+**JSON-path declared types.** Stream 17 introduces a parallel table for
+typed dotted paths on `JSONField` columns. See § 6.1 for the wire format
+and full default operator table.
+
 ### NULL semantics
 
 Standard SQL three-valued-logic applies. Every emitted measure field on
@@ -520,6 +524,102 @@ ordersGroupBy(groupBy: [
 Server resolves to a list of `(field_name, granularity_or_None)` tuples and passes through to `compute_aggregation`.
 
 Multi-level group-by is requested simply by passing multiple specs. The result is a flat list with one row per composite-key bucket.
+
+### 6.1 · JSON property group_by and aggregation
+
+Postgres's JSONB columns are widely used as flexible "extra properties" stores
+for analytics — a single `metadata` JSONB column carries dozens of indexed
+properties. Stream 17 surfaces typed dotted-path access to those keys for both
+`group_by` and aggregation. The scope is deliberately simpler than Odoo's
+`property` field machinery: typed dotted-path access only, no per-property
+selection types, no virtual m2o / m2m, no `jsonb_array_elements` join.
+
+**Wire format — dotted path.** The caller addresses a JSON key via
+`metadata.region` (single dot for one level of nesting). The same path is
+accepted by `compute_aggregation`, `AggregateBuilder`, and the GraphQL
+`groupBy` enum. Multi-level nesting (`metadata.address.city`) raises
+`JSONPathNotAllowed` in v1.0 — it would require nested `KeyTransform` chains
+and ambiguous declared-type wiring; flatten the key client-side or query the
+column directly.
+
+**Allowlist — `json_paths={...}`.** Every requested path MUST appear in the
+caller-supplied `json_paths` allowlist with a declared Python type:
+
+```python
+AggregateBuilder(
+    model=Order,
+    aggregate_fields=["total", "metadata.amount"],
+    group_by_fields=["customer", "metadata.region"],
+    json_paths={
+        "metadata.region": "str",
+        "metadata.amount": "Decimal",
+        "metadata.created_at_iso": "datetime",
+    },
+)
+```
+
+Allowed type tokens: `"str"`, `"int"`, `"float"`, `"Decimal"`, `"bool"`,
+`"date"`, `"datetime"`. Unknown tokens raise `JSONPathNotAllowed`. Paths
+NOT in the allowlist whose first segment IS a `JSONField` raise
+`JSONPathNotAllowed` at resolver entry — fail-loud, mirrors the
+`GroupByFieldNotAllowed` semantics. We do NOT auto-discover JSON keys;
+opting in is explicit.
+
+**Alias form.** Internally the dotted wire path is rewritten to a Django-
+friendly double-underscore alias: `metadata.region` → `metadata__region`.
+The double-underscore separator is Django's own convention for synthetic
+column aliases and never collides with relation traversal because the
+JSON-path branch is dispatched before `_resolve_field`'s relation check.
+The alias is what surfaces in:
+
+- The compiler's row-dict keys (`row["metadata__region"]`,
+  `row["sum_metadata__amount"]`).
+- The Strawberry Python identifier on `<Model>GroupKey` and
+  `<Model>SumFields` (Strawberry then camelCases to wire-side
+  `metadata_Region`, `metadata_Amount`).
+- The GraphQL groupable-field enum value (`METADATA__REGION`).
+- HAVING input field (`sumMetadataAmountGt`, etc).
+
+**Default operators by declared type.** Same shape as `default_operators_for`
+but keyed on the wire token:
+
+| Declared type | Default operators |
+|---|---|
+| `"int"`, `"float"`, `"Decimal"` | `sum, avg, min, max, stddev, variance, stddev_pop, var_pop` |
+| `"str"` | `min, max, array_agg, string_agg` |
+| `"bool"` | `bool_and, bool_or` |
+| `"date"`, `"datetime"` | `min, max` |
+
+Per-path overrides go through the same `operators={...}` dict — keyed on
+the dotted path. Percentile / mode / ordered-set ops are out of v1.0 scope
+for JSON paths (the Cast wrap interacts subtly with PG's `WITHIN GROUP`
+clause; revisit in v1.x).
+
+**Granularity.** `TimeGranularity` and `NumberGranularity` apply only to
+declared `"date"` / `"datetime"` paths. Setting a granularity on a
+`"str"` / `"int"` / etc. path raises `GranularityNotApplicable`, same as
+the Field-based path. Bucket aliases follow the same scheme:
+`metadata.created_at_iso` with `MONTH` becomes
+`metadata__created_at_iso_month`.
+
+**Cast strategy.** The compiler emits `Cast(KeyTextTransform(key, parent),
+output_field=<DjangoField>())` for every typed path; `"str"` skips the
+Cast entirely (JSONB stores text natively). The `KeyTextTransform` reads
+the JSON value as text first, so the cast operates on a text source —
+uniform behaviour across PostgreSQL JSONB and SQLite's JSON1 emulation,
+and avoids JSONB's own type-juggling quirks (a JSON `true` would otherwise
+come out as a JSON boolean rather than a SQL boolean).
+
+**SQLite caveat.** The JSON1 extension stores text natively and casts are
+best-effort. Numeric and boolean casts work in practice for clean data;
+date / datetime casts are subject to SQLite's lenient text→datetime
+parsing and are documented as best-effort. For production analytics, use
+Postgres. The test suite skips datetime-cast bucketing on SQLite.
+
+**Permission-naive — same contract.** JSON paths are exposed identically
+to every caller; row-level scoping is the queryset's responsibility per
+CLAUDE.md Critical Rule 1. We do NOT add a `user`-aware filter on
+JSON-path values; the queryset is trusted.
 
 ## 7 · Date granularity — TIME and NUMBER tracks
 

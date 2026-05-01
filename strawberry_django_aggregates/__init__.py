@@ -47,6 +47,7 @@ from strawberry_django_aggregates.compiler import (
 from strawberry_django_aggregates.errors import (
     AggregateError,
     AggregationAcrossRelationError,
+    JSONPathNotAllowed,
     OperatorNotSupportedError,
     OrderFieldNotAllowed,
 )
@@ -122,4 +123,5 @@ __all__ = [
     "OperatorNotSupportedError",
     "OrderFieldNotAllowed",
     "AggregationAcrossRelationError",
+    "JSONPathNotAllowed",
 ]

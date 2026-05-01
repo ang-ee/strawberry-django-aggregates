@@ -83,6 +83,65 @@ _ID_OPS = (
 )
 
 
+# Default operator allowlists for declared JSON-path types. Mirrors the
+# field-type defaults above, but keyed on the wire-level type tokens the
+# caller passes in :class:`AggregateBuilder.json_paths`. Per SPEC § 6.1.
+#
+# ``stddev``/``variance``/``stddev_pop``/``var_pop`` are excluded — JSONB
+# casts go through ``Cast(KeyTransform(...))`` which Postgres' window /
+# ordered-set machinery can struggle with through the JSON cast wrap;
+# the simpler SUM/AVG/MIN/MAX/MODE shape is enough for v1.0. ``mode`` is
+# included for numeric/string/date types since it returns the column
+# type and works through the cast.
+_JSON_NUMERIC_OPS = (
+    AggregateOp.SUM,
+    AggregateOp.AVG,
+    AggregateOp.MIN,
+    AggregateOp.MAX,
+    AggregateOp.STDDEV,
+    AggregateOp.VARIANCE,
+    AggregateOp.STDDEV_POP,
+    AggregateOp.VAR_POP,
+)
+
+_JSON_STRING_OPS = (
+    AggregateOp.MIN,
+    AggregateOp.MAX,
+    AggregateOp.ARRAY_AGG,
+    AggregateOp.STRING_AGG,
+)
+
+_JSON_BOOL_OPS = (
+    AggregateOp.BOOL_AND,
+    AggregateOp.BOOL_OR,
+)
+
+_JSON_DATE_OPS = (
+    AggregateOp.MIN,
+    AggregateOp.MAX,
+)
+
+
+def default_operators_for_json_type(
+    declared_type: str,
+) -> tuple[AggregateOp, ...]:
+    """Return default operator allowlist for a declared JSON-path type.
+
+    ``declared_type`` is one of the SPEC § 6.1 wire tokens
+    (``"str"``, ``"int"``, ``"float"``, ``"Decimal"``, ``"bool"``,
+    ``"date"``, ``"datetime"``). Unknown tokens return an empty tuple.
+    """
+    if declared_type in {"int", "float", "Decimal"}:
+        return _JSON_NUMERIC_OPS
+    if declared_type == "str":
+        return _JSON_STRING_OPS
+    if declared_type == "bool":
+        return _JSON_BOOL_OPS
+    if declared_type in {"date", "datetime"}:
+        return _JSON_DATE_OPS
+    return ()
+
+
 def default_operators_for(field_type: str) -> tuple[AggregateOp, ...]:
     """Return the default operator allowlist for a Django field type name.
 

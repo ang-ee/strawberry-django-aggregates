@@ -44,6 +44,7 @@ from strawberry_django_aggregates.granularity import (
 from strawberry_django_aggregates.operators import (
     AggregateOp,
     default_operators_for,
+    default_operators_for_json_type,
 )
 
 if TYPE_CHECKING:
@@ -238,6 +239,32 @@ _INTEGRAL_TYPES: frozenset[str] = frozenset({
 })
 
 
+# Wire-token → Python type for declared JSON-path types (SPEC § 6.1).
+_JSON_DECLARED_TO_PY: dict[str, Any] = {
+    "str":      str,
+    "int":      int,
+    "float":    float,
+    "Decimal":  decimal.Decimal,
+    "bool":     bool,
+    "date":     datetime.date,
+    "datetime": datetime.datetime,
+}
+
+
+def _natural_python_type_for_json(declared_type: str) -> Any:
+    """Map a declared-JSON-path type token to its Python output type.
+
+    Mirrors :func:`_natural_python_type` but operates on the SPEC § 6.1
+    string tokens rather than Django ``Field`` instances. Used by
+    :func:`_aggregate_python_type` for JSON-path measures and by
+    :func:`_emit_group_key` for JSON-path group keys.
+
+    Unknown tokens fall through to ``str`` — same defensive default as
+    the Field-based helper.
+    """
+    return _JSON_DECLARED_TO_PY.get(declared_type, str)
+
+
 def _natural_python_type(field: Field) -> Any:
     """Map a Django field to its natural Python output type.
 
@@ -326,6 +353,51 @@ def _aggregate_python_type(op: AggregateOp, field: Field) -> Any:
     raise ValueError(f"Unhandled operator {op!r}")  # defensive
 
 
+def _aggregate_python_type_for_json(
+    op: AggregateOp, declared_type: str,
+) -> Any:
+    """Output Python type for ``(op, declared_type)`` JSON-path measures.
+
+    Mirrors :func:`_aggregate_python_type` but operates on the
+    SPEC § 6.1 type tokens. ``SUM`` over an integer-typed JSON path
+    widens to :data:`BigInt` for the same overflow reason as the
+    Field-based path.
+    """
+    if op in {AggregateOp.MIN, AggregateOp.MAX}:
+        return _natural_python_type_for_json(declared_type)
+    if op is AggregateOp.SUM:
+        if declared_type == "Decimal":
+            return decimal.Decimal
+        if declared_type == "float":
+            return float
+        if declared_type == "int":
+            return BigInt
+        return _natural_python_type_for_json(declared_type)
+    if op is AggregateOp.AVG:
+        if declared_type == "Decimal":
+            return decimal.Decimal
+        return float
+    if op in {
+        AggregateOp.STDDEV,
+        AggregateOp.VARIANCE,
+        AggregateOp.STDDEV_POP,
+        AggregateOp.VAR_POP,
+    }:
+        return float
+    if op in {AggregateOp.PERCENTILE_CONT, AggregateOp.PERCENTILE_DISC}:
+        return float
+    if op is AggregateOp.MODE:
+        return _natural_python_type_for_json(declared_type)
+    if op in {AggregateOp.BOOL_AND, AggregateOp.BOOL_OR}:
+        return bool
+    if op is AggregateOp.ARRAY_AGG:
+        item_type = _natural_python_type_for_json(declared_type)
+        return list[item_type]  # type: ignore[misc,valid-type]
+    if op is AggregateOp.STRING_AGG:
+        return str
+    raise ValueError(f"Unhandled operator {op!r}")  # defensive
+
+
 # ---------------------------------------------------------------------------
 # Allowlist resolution
 # ---------------------------------------------------------------------------
@@ -333,9 +405,16 @@ def _aggregate_python_type(op: AggregateOp, field: Field) -> Any:
 def _resolve_aggregate_fields(
     model: type[Model],
     aggregate_fields: list[str] | None,
+    json_paths: dict[str, str] | None = None,
 ) -> list[str]:
     """When ``aggregate_fields`` is None, default to all concrete model
     fields whose default operator allowlist is non-empty.
+
+    ``aggregate_fields`` may include JSON paths in dotted form
+    (``metadata.amount``); these MUST also appear in ``json_paths`` —
+    we don't auto-discover JSON keys. The returned list contains
+    field-name strings as supplied (dotted for JSON paths) so
+    downstream consumers can detect JSON entries via ``.`` membership.
     """
     if aggregate_fields is not None:
         return list(aggregate_fields)
@@ -352,13 +431,27 @@ def _resolve_aggregate_fields(
         type_name = type(field).__name__
         if default_operators_for(type_name):
             eligible.append(field.name)
+    # Append JSON paths in caller-declared order. Sorted to honour
+    # CLAUDE.md Critical Rule 2 — iteration over the dict can otherwise
+    # leak insertion order into the SDL.
+    if json_paths:
+        for path in sorted(json_paths):
+            if default_operators_for_json_type(json_paths[path]):
+                eligible.append(path)
     return eligible
 
 
 def _resolve_group_by_fields(
     model: type[Model],
     group_by_fields: list[str] | None,
+    json_paths: dict[str, str] | None = None,
 ) -> list[str]:
+    """Resolve the group-by field allowlist.
+
+    Like :func:`_resolve_aggregate_fields`, JSON paths declared in
+    ``json_paths`` are appended in sorted order when no explicit
+    ``group_by_fields`` list was supplied.
+    """
     if group_by_fields is not None:
         return list(group_by_fields)
     eligible: list[str] = []
@@ -371,6 +464,9 @@ def _resolve_group_by_fields(
                 or getattr(field, "one_to_many", False):
             continue
         eligible.append(field.name)
+    if json_paths:
+        for path in sorted(json_paths):
+            eligible.append(path)
     return eligible
 
 
@@ -378,9 +474,18 @@ def _allowed_ops_for(
     model: type[Model],
     field_name: str,
     overrides: dict[str, tuple[AggregateOp, ...]],
+    json_paths: dict[str, str] | None = None,
 ) -> tuple[AggregateOp, ...]:
+    """Resolve allowed operators for a field name OR a dotted JSON path.
+
+    Per-name overrides win over both the JSON-path defaults and the
+    Field-type defaults. JSON paths use the dotted wire form as the
+    override key (``"metadata.amount"``); lookups are exact-match.
+    """
     if field_name in overrides:
         return overrides[field_name]
+    if json_paths and field_name in json_paths:
+        return default_operators_for_json_type(json_paths[field_name])
     field = model._meta.get_field(field_name)
     return default_operators_for(type(field).__name__)
 
@@ -417,6 +522,7 @@ def make_aggregate_type(
     aggregate_fields: list[str] | None = None,
     operators: dict[str, tuple[AggregateOp, ...]] | None = None,
     enable_federation: bool = False,
+    json_paths: dict[str, str] | None = None,
 ) -> type:
     """Build the ``<Model>Aggregate`` strawberry type.
 
@@ -435,13 +541,18 @@ def make_aggregate_type(
     """
     name      = name or model.__name__
     overrides = dict(sorted((operators or {}).items()))
-    fields    = _resolve_aggregate_fields(model, aggregate_fields)
+    fields    = _resolve_aggregate_fields(
+        model, aggregate_fields, json_paths,
+    )
 
     nested_types = _emit_nested_operator_types(
         model, name, fields, overrides,
         enable_federation=enable_federation,
+        json_paths=json_paths,
     )
-    countable_enum = _emit_countable_enum(model, name, fields, overrides)
+    countable_enum = _emit_countable_enum(
+        model, name, fields, overrides, json_paths=json_paths,
+    )
 
     aggregate_dc_fields: list[tuple[str, Any, Any]] = [
         ("count", int, 0),
@@ -536,7 +647,7 @@ def make_aggregate_type(
     # allowlist supports either operator — otherwise the enum would
     # have no members and Strawberry would fail at schema build time.
     percentile_enum = _emit_percentile_enum(
-        model, name, fields, overrides,
+        model, name, fields, overrides, json_paths=json_paths,
     )
     if percentile_enum is not None:
         def _percentile_cont_resolver(
@@ -596,12 +707,19 @@ def _emit_nested_operator_types(
     overrides: dict[str, tuple[AggregateOp, ...]],
     *,
     enable_federation: bool = False,
+    json_paths: dict[str, str] | None = None,
 ) -> dict[AggregateOp, type]:
     """Build the per-operator ``<Model>{Op}Fields`` types.
 
     Only operators that have at least one applicable field on the
     allowlist materialize. Field declaration order within each nested
     type follows ``fields`` (caller-controlled, deterministic).
+
+    JSON paths in ``fields`` (``metadata.amount``) emit a Strawberry
+    field whose name is the alias form (``metadata__amount``) — the
+    underscore form survives GraphQL naming rules where the dotted
+    form would not. The Python type comes from the declared JSON type
+    rather than a Django Field.
     """
     decorator = _type_decorator(enable_federation)
     out: dict[AggregateOp, type] = {}
@@ -613,12 +731,22 @@ def _emit_nested_operator_types(
             continue
         op_fields: list[tuple[str, Any, Any]] = []
         for field_name in fields:
-            allowed = _allowed_ops_for(model, field_name, overrides)
+            allowed = _allowed_ops_for(
+                model, field_name, overrides, json_paths,
+            )
             if op not in allowed:
                 continue
-            field = model._meta.get_field(field_name)
-            py_type = _aggregate_python_type(op, field)  # type: ignore[arg-type]
-            op_fields.append((field_name, (py_type | None), None))
+            if json_paths and field_name in json_paths:
+                declared_type = json_paths[field_name]
+                py_type = _aggregate_python_type_for_json(
+                    op, declared_type,
+                )
+                emit_name = field_name.replace(".", "__")
+            else:
+                field = model._meta.get_field(field_name)
+                py_type = _aggregate_python_type(op, field)  # type: ignore[arg-type]
+                emit_name = field_name
+            op_fields.append((emit_name, (py_type | None), None))
         if not op_fields:
             continue
         nested_name = f"{name}{_op_class_suffix(op)}Fields"
@@ -637,6 +765,8 @@ def _emit_percentile_enum(
     name: str,
     fields: list[str],
     overrides: dict[str, tuple[AggregateOp, ...]],
+    *,
+    json_paths: dict[str, str] | None = None,
 ) -> type[enum.Enum] | None:
     """Build ``<Model>PercentileField`` — fields whose allowlist allows
     either percentile op.
@@ -653,12 +783,15 @@ def _emit_percentile_enum(
     """
     members: list[tuple[str, str]] = []
     for field_name in fields:
-        allowed = _allowed_ops_for(model, field_name, overrides)
+        allowed = _allowed_ops_for(
+            model, field_name, overrides, json_paths,
+        )
         if (
             AggregateOp.PERCENTILE_CONT in allowed
             or AggregateOp.PERCENTILE_DISC in allowed
         ):
-            members.append((field_name.upper(), field_name))
+            emit_name = field_name.replace(".", "__")
+            members.append((emit_name.upper(), emit_name))
     if not members:
         return None
     enum_cls = enum.Enum(  # type: ignore[misc]
@@ -672,18 +805,23 @@ def _emit_countable_enum(
     name: str,
     fields: list[str],
     overrides: dict[str, tuple[AggregateOp, ...]],
+    *,
+    json_paths: dict[str, str] | None = None,
 ) -> type[enum.Enum]:
     """Build ``<Model>CountableField`` — fields whose allowlist includes
     ``COUNT`` or ``COUNT_DISTINCT`` (in practice all model PKs / FKs).
     """
     members: list[tuple[str, str]] = [("ID", "id")]
     for field_name in fields:
-        allowed = _allowed_ops_for(model, field_name, overrides)
+        allowed = _allowed_ops_for(
+            model, field_name, overrides, json_paths,
+        )
         if AggregateOp.COUNT_DISTINCT in allowed or not allowed:
             # Always allow plain field-name distinct counts on
             # allowlisted fields; they're row-level, not value-level.
             pass
-        members.append((field_name.upper(), field_name))
+        emit_name = field_name.replace(".", "__")
+        members.append((emit_name.upper(), emit_name))
     # Deduplicate while preserving canonical order: ID first, then
     # field declaration order.
     seen: set[str] = set()
@@ -712,6 +850,7 @@ def make_grouped_type(
     group_by_fields: list[str] | None = None,
     operators: dict[str, tuple[AggregateOp, ...]] | None = None,
     enable_federation: bool = False,
+    json_paths: dict[str, str] | None = None,
 ) -> tuple[type, type, type]:
     """Build ``<Model>GroupKey``, ``<Model>Grouped``, and
     ``<Model>GroupedResult`` types.
@@ -728,15 +867,22 @@ def make_grouped_type(
     """
     name      = name or model.__name__
     overrides = dict(sorted((operators or {}).items()))
-    g_fields  = _resolve_group_by_fields(model, group_by_fields)
-    a_fields  = _resolve_aggregate_fields(model, aggregate_fields)
+    g_fields  = _resolve_group_by_fields(
+        model, group_by_fields, json_paths,
+    )
+    a_fields  = _resolve_aggregate_fields(
+        model, aggregate_fields, json_paths,
+    )
 
     group_key_cls = _emit_group_key(
-        model, name, g_fields, enable_federation=enable_federation,
+        model, name, g_fields,
+        enable_federation=enable_federation,
+        json_paths=json_paths,
     )
     nested_types  = _emit_nested_operator_types(
         model, name, a_fields, overrides,
         enable_federation=enable_federation,
+        json_paths=json_paths,
     )
 
     grouped_dc_fields: list[tuple[str, Any, Any]] = [
@@ -788,6 +934,7 @@ def _emit_group_key(
     g_fields: list[str],
     *,
     enable_federation: bool = False,
+    json_paths: dict[str, str] | None = None,
 ) -> type:
     """Build ``<Model>GroupKey`` — every allowlisted group_by field as
     Optional, plus bucket fields for date/datetime entries.
@@ -805,6 +952,33 @@ def _emit_group_key(
     key_fields: list[tuple[str, Any, Any]] = []
     fk_field_names: list[str] = []
     for field_name in g_fields:
+        # JSON-path branch — emit alias-form name (``metadata__region``)
+        # whose Python type derives from the declared JSON token.
+        if json_paths and field_name in json_paths:
+            declared_type = json_paths[field_name]
+            alias_name = field_name.replace(".", "__")
+            py_type = _natural_python_type_for_json(declared_type)
+            key_fields.append((alias_name, (py_type | None), None))
+            if declared_type in {"date", "datetime"}:
+                for time_grain in TimeGranularity:
+                    key_fields.append((
+                        f"{alias_name}_{time_grain.value}",
+                        (datetime.datetime | None),
+                        None,
+                    ))
+                    key_fields.append((
+                        f"{alias_name}_{time_grain.value}_range",
+                        (BucketRange | None),
+                        None,
+                    ))
+                for num_grain in NumberGranularity:
+                    key_fields.append((
+                        f"{alias_name}_{num_grain.value}",
+                        (int | None),
+                        None,
+                    ))
+            continue
+
         field = model._meta.get_field(field_name)
         py_type = _natural_python_type(field)  # type: ignore[arg-type]
         # FK fields surface as `<name>_id` per SPEC § 4.
@@ -869,6 +1043,7 @@ def make_having_input(
     aggregate_fields: list[str] | None = None,
     operators: dict[str, tuple[AggregateOp, ...]] | None = None,
     enable_federation: bool = False,
+    json_paths: dict[str, str] | None = None,
 ) -> type:
     """Build the ``<Model>Having`` strawberry input type.
 
@@ -885,7 +1060,9 @@ def make_having_input(
     """
     name      = name or model.__name__
     overrides = dict(sorted((operators or {}).items()))
-    fields    = _resolve_aggregate_fields(model, aggregate_fields)
+    fields    = _resolve_aggregate_fields(
+        model, aggregate_fields, json_paths,
+    )
 
     measures: list[tuple[str, Any]] = []  # (measure_name, value_type)
 
@@ -900,14 +1077,24 @@ def make_having_input(
         if op in _METHOD_STYLE_OPERATORS:
             continue
         for field_name in fields:
-            allowed = _allowed_ops_for(model, field_name, overrides)
+            allowed = _allowed_ops_for(
+                model, field_name, overrides, json_paths,
+            )
             if op not in allowed:
                 continue
-            field = model._meta.get_field(field_name)
-            value_type = _aggregate_python_type(
-                op, field,  # type: ignore[arg-type]
-            )
-            measures.append((f"{op.value}_{field_name}", value_type))
+            if json_paths and field_name in json_paths:
+                declared_type = json_paths[field_name]
+                value_type = _aggregate_python_type_for_json(
+                    op, declared_type,
+                )
+                measure_name = f"{op.value}_{field_name.replace('.', '__')}"
+            else:
+                field = model._meta.get_field(field_name)
+                value_type = _aggregate_python_type(
+                    op, field,  # type: ignore[arg-type]
+                )
+                measure_name = f"{op.value}_{field_name}"
+            measures.append((measure_name, value_type))
 
     having_dc_fields: list[tuple[str, Any, Any]] = []
     for measure, value_type in measures:
@@ -935,6 +1122,7 @@ def make_group_by_spec(
     name: str | None = None,
     group_by_fields: list[str] | None = None,
     enable_federation: bool = False,
+    json_paths: dict[str, str] | None = None,
 ) -> tuple[type, type]:
     """Build ``<Model>GroupBySpec`` (input) + ``<Model>GroupableField``
     (enum). Returns ``(spec_type, enum_type)``.
@@ -943,14 +1131,24 @@ def make_group_by_spec(
     ``granularity: Granularity`` (nullable; required only on date /
     datetime fields per SPEC § 6).
 
+    JSON paths (``metadata.region``) are surfaced as enum members in
+    their alias form (``METADATA__REGION``); the resolver translates
+    back to the dotted form before reaching the compiler.
+
     ``enable_federation=True`` swaps the input decorator to
     :func:`strawberry.federation.input` so the type is registered with
     the federation subgraph. The enum is unchanged.
     """
     name     = name or model.__name__
-    g_fields = _resolve_group_by_fields(model, group_by_fields)
+    g_fields = _resolve_group_by_fields(
+        model, group_by_fields, json_paths,
+    )
 
-    members = [(field_name.upper(), field_name) for field_name in g_fields]
+    members = [
+        (field_name.replace(".", "__").upper(),
+         field_name.replace(".", "__"))
+        for field_name in g_fields
+    ]
     enum_cls = enum.Enum(  # type: ignore[misc]
         f"{name}GroupableField", members,
     )
