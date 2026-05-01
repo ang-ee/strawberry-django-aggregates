@@ -31,6 +31,7 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 import strawberry
+import strawberry.federation
 from strawberry_django.pagination import OffsetPaginationInfo
 
 from strawberry_django_aggregates.granularity import (
@@ -45,6 +46,30 @@ from strawberry_django_aggregates.operators import (
 if TYPE_CHECKING:
     from django.db.models import Model
     from django.db.models.fields import Field
+
+
+# ---------------------------------------------------------------------------
+# Federation v2 helpers (SPEC § 18).
+# ---------------------------------------------------------------------------
+#
+# When ``enable_federation=True`` the consumer must build the schema with
+# ``strawberry.federation.Schema(...)`` (NOT ``strawberry.Schema``) for
+# directives to print and for the ``_service`` introspection to be valid.
+# Library does not control schema construction; we only emit
+# federation-decorated types.
+
+def _type_decorator(enable_federation: bool) -> Any:
+    """Return the right object-type decorator for the federation flag."""
+    if enable_federation:
+        return strawberry.federation.type
+    return strawberry.type
+
+
+def _input_decorator(enable_federation: bool) -> Any:
+    """Return the right input-type decorator for the federation flag."""
+    if enable_federation:
+        return strawberry.federation.input
+    return strawberry.input
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +327,7 @@ def make_aggregate_type(
     name: str | None = None,
     aggregate_fields: list[str] | None = None,
     operators: dict[str, tuple[AggregateOp, ...]] | None = None,
+    enable_federation: bool = False,
 ) -> type:
     """Build the ``<Model>Aggregate`` strawberry type.
 
@@ -309,6 +335,14 @@ def make_aggregate_type(
     nullable nested type per field-distributed operator. Nested types
     are emitted in canonical order (``sum, avg, min, max, stddev,
     variance, bool_and, bool_or, array_agg, string_agg``) per Rule 2.
+
+    When ``enable_federation=True`` the emitted type is decorated with
+    :func:`strawberry.federation.type` instead of :func:`strawberry.type`
+    so it is recognized by an Apollo Federation v2 gateway. The aggregate
+    container itself receives no ``@key`` directive in v1.0 — see
+    SPEC § 18 for the deferred ``@key`` design discussion. Nested
+    operator types (``<Model>SumFields`` etc.) are also federation-decorated
+    so their schema-printer payload remains consistent.
     """
     name      = name or model.__name__
     overrides = dict(sorted((operators or {}).items()))
@@ -316,6 +350,7 @@ def make_aggregate_type(
 
     nested_types = _emit_nested_operator_types(
         model, name, fields, overrides,
+        enable_federation=enable_federation,
     )
     countable_enum = _emit_countable_enum(model, name, fields, overrides)
 
@@ -348,7 +383,7 @@ def make_aggregate_type(
         description="COUNT(DISTINCT <field>) — pass the field to count.",
     )
 
-    return strawberry.type(cls)
+    return _type_decorator(enable_federation)(cls)
 
 
 def _emit_nested_operator_types(
@@ -356,6 +391,8 @@ def _emit_nested_operator_types(
     name: str,
     fields: list[str],
     overrides: dict[str, tuple[AggregateOp, ...]],
+    *,
+    enable_federation: bool = False,
 ) -> dict[AggregateOp, type]:
     """Build the per-operator ``<Model>{Op}Fields`` types.
 
@@ -363,6 +400,7 @@ def _emit_nested_operator_types(
     allowlist materialize. Field declaration order within each nested
     type follows ``fields`` (caller-controlled, deterministic).
     """
+    decorator = _type_decorator(enable_federation)
     out: dict[AggregateOp, type] = {}
     for op in _FIELD_OPERATORS:
         op_fields: list[tuple[str, Any, Any]] = []
@@ -377,7 +415,7 @@ def _emit_nested_operator_types(
             continue
         nested_name = f"{name}{_op_class_suffix(op)}Fields"
         cls = _make_dataclass(nested_name, op_fields)
-        out[op] = strawberry.type(cls)
+        out[op] = decorator(cls)
     return out
 
 
@@ -430,6 +468,7 @@ def make_grouped_type(
     aggregate_fields: list[str] | None = None,
     group_by_fields: list[str] | None = None,
     operators: dict[str, tuple[AggregateOp, ...]] | None = None,
+    enable_federation: bool = False,
 ) -> tuple[type, type, type]:
     """Build ``<Model>GroupKey``, ``<Model>Grouped``, and
     ``<Model>GroupedResult`` types.
@@ -437,15 +476,24 @@ def make_grouped_type(
     Returns ``(group_key_type, grouped_type, grouped_result_type)``.
     The grouped type is FLAT — no ``subgroups`` recursion. Multi-level
     group_by produces multiple result rows with composite keys (SPEC §4).
+
+    When ``enable_federation=True`` all three returned types are
+    decorated with :func:`strawberry.federation.type`. Foreign-key
+    fields on ``<Model>GroupKey`` (e.g. ``customer_id``) are marked
+    ``@external`` since their canonical ownership lives in another
+    subgraph — see SPEC § 18.
     """
     name      = name or model.__name__
     overrides = dict(sorted((operators or {}).items()))
     g_fields  = _resolve_group_by_fields(model, group_by_fields)
     a_fields  = _resolve_aggregate_fields(model, aggregate_fields)
 
-    group_key_cls = _emit_group_key(model, name, g_fields)
+    group_key_cls = _emit_group_key(
+        model, name, g_fields, enable_federation=enable_federation,
+    )
     nested_types  = _emit_nested_operator_types(
         model, name, a_fields, overrides,
+        enable_federation=enable_federation,
     )
 
     grouped_dc_fields: list[tuple[str, Any, Any]] = [
@@ -457,7 +505,8 @@ def make_grouped_type(
             grouped_dc_fields.append(
                 (op.value, nested_types[op] | None, None),
             )
-    grouped_cls = strawberry.type(_make_dataclass(
+    decorator = _type_decorator(enable_federation)
+    grouped_cls = decorator(_make_dataclass(
         f"{name}Grouped", grouped_dc_fields,
     ))
 
@@ -465,7 +514,7 @@ def make_grouped_type(
     # page_info + total_count) without subclassing the generic — that
     # way the resolver can hand back precomputed values rather than a
     # queryset (which doesn't apply to dict-based aggregation rows).
-    grouped_result_cls = strawberry.type(_make_dataclass(
+    grouped_result_cls = decorator(_make_dataclass(
         f"{name}GroupedResult",
         [
             ("results", list[grouped_cls], dataclasses.MISSING),  # type: ignore[valid-type]
@@ -481,6 +530,8 @@ def _emit_group_key(
     model: type[Model],
     name: str,
     g_fields: list[str],
+    *,
+    enable_federation: bool = False,
 ) -> type:
     """Build ``<Model>GroupKey`` — every allowlisted group_by field as
     Optional, plus bucket fields for date/datetime entries.
@@ -489,14 +540,22 @@ def _emit_group_key(
     :func:`compiler.group_by_alias` (e.g. ``created_at_month``,
     ``created_at_day_of_week``). Caller-side resolver populates only
     the keys present in the actual ``group_by`` request.
+
+    When ``enable_federation=True``, FK ``<name>_id`` fields are marked
+    ``@external`` because their canonical record lives in another
+    subgraph (SPEC § 18). The non-federation path emits plain dataclass
+    fields, identical to v0.x output.
     """
     key_fields: list[tuple[str, Any, Any]] = []
+    fk_field_names: list[str] = []
     for field_name in g_fields:
         field = model._meta.get_field(field_name)
         py_type = _natural_python_type(field)  # type: ignore[arg-type]
         # FK fields surface as `<name>_id` per SPEC § 4.
         if getattr(field, "many_to_one", False):
-            key_fields.append((f"{field_name}_id", (py_type | None), None))
+            fk_id_name = f"{field_name}_id"
+            key_fields.append((fk_id_name, (py_type | None), None))
+            fk_field_names.append(fk_id_name)
         else:
             key_fields.append((field_name, (py_type | None), None))
 
@@ -517,7 +576,20 @@ def _emit_group_key(
                 ))
 
     cls = _make_dataclass(f"{name}GroupKey", key_fields)
-    return strawberry.type(cls)
+
+    if enable_federation:
+        # Re-bind FK `<name>_id` attributes as federation fields with
+        # ``@external``. Done AFTER ``make_dataclass`` because passing
+        # a federation field as a dataclass default does not mark the
+        # resulting attribute as external — the federation directive
+        # is attached only when the attribute is later read by the
+        # ``strawberry.federation.type`` decorator.
+        for fk_name in fk_field_names:
+            setattr(
+                cls, fk_name,
+                strawberry.federation.field(default=None, external=True),
+            )
+    return _type_decorator(enable_federation)(cls)
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +602,7 @@ def make_having_input(
     name: str | None = None,
     aggregate_fields: list[str] | None = None,
     operators: dict[str, tuple[AggregateOp, ...]] | None = None,
+    enable_federation: bool = False,
 ) -> type:
     """Build the ``<Model>Having`` strawberry input type.
 
@@ -537,6 +610,12 @@ def make_having_input(
     ``measure`` is ``count`` or ``<op>_<field>`` and ``comparison`` is
     one of the canonical 8. Fields are ``(T | None)`` so callers can
     selectively set comparisons. Per SPEC § 8.
+
+    ``enable_federation=True`` swaps :func:`strawberry.input` for
+    :func:`strawberry.federation.input`. Federation v2 input types do
+    not accept ``@external`` (it is an output-only directive); the flag
+    is forwarded for symmetry and so the resulting input is registered
+    consistently in the federation subgraph.
     """
     name      = name or model.__name__
     overrides = dict(sorted((operators or {}).items()))
@@ -571,7 +650,7 @@ def make_having_input(
             )
 
     cls = _make_dataclass(f"{name}Having", having_dc_fields)
-    return strawberry.input(cls)
+    return _input_decorator(enable_federation)(cls)
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +662,7 @@ def make_group_by_spec(
     *,
     name: str | None = None,
     group_by_fields: list[str] | None = None,
+    enable_federation: bool = False,
 ) -> tuple[type, type]:
     """Build ``<Model>GroupBySpec`` (input) + ``<Model>GroupableField``
     (enum). Returns ``(spec_type, enum_type)``.
@@ -590,6 +670,10 @@ def make_group_by_spec(
     The spec input has fields ``field: <Model>GroupableField!`` and
     ``granularity: Granularity`` (nullable; required only on date /
     datetime fields per SPEC § 6).
+
+    ``enable_federation=True`` swaps the input decorator to
+    :func:`strawberry.federation.input` so the type is registered with
+    the federation subgraph. The enum is unchanged.
     """
     name     = name or model.__name__
     g_fields = _resolve_group_by_fields(model, group_by_fields)
@@ -607,7 +691,7 @@ def make_group_by_spec(
             ("granularity", (Granularity | None), None),
         ],
     )
-    return strawberry.input(spec_cls), field_enum
+    return _input_decorator(enable_federation)(spec_cls), field_enum
 
 
 # ---------------------------------------------------------------------------
@@ -618,12 +702,16 @@ def make_group_order_input(
     model: type[Model],
     *,
     name: str | None = None,
+    enable_federation: bool = False,
 ) -> type:
     """Build ``<Model>GroupOrder`` — order input for groupBy results.
 
     Per SPEC § 9: ``field: String!`` (resolved at parse time against
     aggregate aliases / group_by aliases / plain field allowlist),
     ``direction: OrderDirection!``, ``nulls: NullsPosition``.
+
+    ``enable_federation=True`` swaps the input decorator to
+    :func:`strawberry.federation.input` (SPEC § 18).
     """
     name = name or model.__name__
     cls = _make_dataclass(
@@ -634,4 +722,4 @@ def make_group_order_input(
             ("nulls", (NullsPosition | None), None),
         ],
     )
-    return strawberry.input(cls)
+    return _input_decorator(enable_federation)(cls)
