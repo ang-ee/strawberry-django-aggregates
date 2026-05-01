@@ -131,6 +131,7 @@ def _resolve(
 
 def aggregate_aliases_from_spec(
     aggregates: list[tuple[AggregateOp | str, str | None]],
+    op_args: dict[str, dict[str, Any]] | None = None,
 ) -> list[str]:
     """Compute the alias names :func:`compute_aggregation` will emit
     for a given aggregate spec.
@@ -139,14 +140,38 @@ def aggregate_aliases_from_spec(
     :func:`compiler.aggregate_alias`. Used by the order parser and the
     HAVING input validator. Per Critical Rule 9, importing from
     ``compiler`` here is fine — both modules are framework-agnostic.
+
+    Percentile ops require their per-call ``fraction`` to compute the
+    final SQL alias (``percentile_cont_total_50``). When ``op_args`` is
+    provided, fractions keyed by the bare ``<op>_<field>`` alias are
+    threaded through. Without ``op_args``, percentile entries are
+    skipped (no alias is added) — the order parser then refuses any
+    user attempt to order by a percentile alias, which matches v1.0
+    scope (percentiles are method-style, not orderable from GraphQL).
     """
     # Local import avoids a circular-import risk if compiler ever
     # adds an ordering helper.
     from strawberry_django_aggregates.compiler import aggregate_alias
 
+    op_args = op_args or {}
     aliases: list[str] = []
     for op, field_path in aggregates:
         op_enum = op if isinstance(op, AggregateOp) else AggregateOp(op)
+        if op_enum in {
+            AggregateOp.PERCENTILE_CONT, AggregateOp.PERCENTILE_DISC,
+        }:
+            if field_path is None:
+                continue
+            base = f"{op_enum.value}_{field_path}"
+            args = op_args.get(base)
+            if not args or "fraction" not in args:
+                continue
+            aliases.append(
+                aggregate_alias(
+                    op_enum, field_path, fraction=args["fraction"],
+                ),
+            )
+            continue
         aliases.append(aggregate_alias(op_enum, field_path))
     return aliases
 

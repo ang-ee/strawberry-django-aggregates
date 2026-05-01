@@ -213,11 +213,16 @@ class AggregateBuilder:
             qs = builder._resolve_queryset(info)
             if filter is not None:
                 qs = apply_filters(filter, qs, info=info)
-            requested = builder._requested_aggregate_ops(info, a_fields)
-            rows = compute_aggregation(qs, aggregates=requested)
+            op_args: dict[str, dict[str, Any]] = {}
+            requested = builder._requested_aggregate_ops(
+                info, a_fields, op_args=op_args,
+            )
+            rows = compute_aggregation(
+                qs, aggregates=requested, op_args=op_args,
+            )
             row = rows[0] if rows else {}
             return builder._shape_aggregate(
-                aggregate_type, row, requested,
+                aggregate_type, row, requested, op_args=op_args,
             )
 
         annotations: dict[str, Any] = {
@@ -269,8 +274,9 @@ class AggregateBuilder:
                 qs = apply_filters(filter, qs, info=info)
 
             spec = builder._translate_group_by(group_by)
+            op_args: dict[str, dict[str, Any]] = {}
             requested = builder._requested_aggregate_ops_grouped(
-                info, a_fields,
+                info, a_fields, op_args=op_args,
             )
             having_dict = builder._translate_having(having, requested)
             order_terms = builder._translate_order_by(
@@ -292,13 +298,15 @@ class AggregateBuilder:
                 offset=offset,
                 limit=limit,
                 respect_comodel_ordering=builder.respect_comodel_ordering,
+                op_args=op_args,
             )
             total = builder._count_groups(
-                qs, spec, requested, having_dict,
+                qs, spec, requested, having_dict, op_args=op_args,
             )
             grouped_rows = [
                 builder._shape_grouped(
                     grouped_type, group_key_type, row, requested, spec,
+                    op_args=op_args,
                 )
                 for row in rows
             ]
@@ -363,16 +371,24 @@ class AggregateBuilder:
 
     def _requested_aggregate_ops(
         self, info: Any, a_fields: list[str],
+        op_args: dict[str, dict[str, Any]] | None = None,
     ) -> list[tuple[AggregateOp, str | None]]:
         """Inspect ``info.selected_fields`` and emit only the (op, field)
         pairs the client requested. Always include ``count`` so the
         non-null ``Int!`` field has a value; nested types only contribute
         ops the schema actually asks for.
+
+        When ``op_args`` is provided, percentile method-style fields'
+        ``fraction`` arguments are recorded under their bare
+        ``<op>_<field>`` alias (the percentile-suffix is derived later
+        in :func:`compiler.aggregate_alias`).
         """
         requested: list[tuple[AggregateOp, str | None]] = [
             (AggregateOp.COUNT, None),
         ]
-        for entry in self._iter_selected_ops(info, a_fields):
+        for entry in self._iter_selected_ops(
+            info, a_fields, op_args=op_args,
+        ):
             requested.append(entry)
         # Deduplicate in case the same (op, field) appears twice.
         seen: set[tuple[Any, Any]] = set()
@@ -386,6 +402,7 @@ class AggregateBuilder:
 
     def _requested_aggregate_ops_grouped(
         self, info: Any, a_fields: list[str],
+        op_args: dict[str, dict[str, Any]] | None = None,
     ) -> list[tuple[AggregateOp, str | None]]:
         """Walk the GraphQL selection set for the grouped resolver.
 
@@ -402,7 +419,9 @@ class AggregateBuilder:
                 if getattr(sub, "name", None) != "results":
                     continue
                 requested.extend(
-                    self._extract_ops_from_grouped(sub, a_fields),
+                    self._extract_ops_from_grouped(
+                        sub, a_fields, op_args=op_args,
+                    ),
                 )
         seen: set[tuple[Any, Any]] = set()
         deduped: list[tuple[AggregateOp, str | None]] = []
@@ -415,9 +434,12 @@ class AggregateBuilder:
 
     def _iter_selected_ops(
         self, info: Any, a_fields: list[str],
+        op_args: dict[str, dict[str, Any]] | None = None,
     ) -> Iterable[tuple[AggregateOp, str | None]]:
         for sel in getattr(info, "selected_fields", []) or []:
-            yield from self._extract_ops_from_grouped(sel, a_fields)
+            yield from self._extract_ops_from_grouped(
+                sel, a_fields, op_args=op_args,
+            )
 
     @staticmethod
     def _flatten_selections(node: Any) -> Iterable[Any]:
@@ -444,15 +466,21 @@ class AggregateBuilder:
 
     def _extract_ops_from_grouped(
         self, grouped_sel: Any, a_fields: list[str],
+        op_args: dict[str, dict[str, Any]] | None = None,
     ) -> Iterable[tuple[AggregateOp, str | None]]:
         """Inspect a Grouped-or-Aggregate selection set and yield
         ``(op, field)`` for each aggregate measure the client requested.
 
         GraphQL field names are camelCase on the wire; we map back to
         snake_case via :data:`_OP_FROM_WIRE`. ``count`` is yielded with
-        ``field=None``; ``count_distinct`` reads the ``field`` argument
+        ``field=None``; ``count_distinct`` and ``percentileCont`` /
+        ``percentileDisc`` read the ``field`` (and ``fraction``) argument
         from the GraphQL operation. Fragments are flattened by
         :meth:`_flatten_selections`.
+
+        Percentile fractions are written into ``op_args`` keyed by the
+        bare ``<op>_<field>`` alias (no fraction suffix). The compiler
+        derives the fraction-suffixed final alias from there.
         """
         for inner in self._flatten_selections(grouped_sel):
             inner_name = getattr(inner, "name", None)
@@ -475,6 +503,23 @@ class AggregateBuilder:
                 fname = self._countable_field_to_path(field_arg)
                 if fname is not None:
                     yield (op, fname)
+                continue
+            if op in {
+                AggregateOp.PERCENTILE_CONT,
+                AggregateOp.PERCENTILE_DISC,
+            }:
+                args = getattr(inner, "arguments", {}) or {}
+                field_arg = args.get("field")
+                fraction_arg = args.get("fraction")
+                if field_arg is None or fraction_arg is None:
+                    continue
+                fname = self._countable_field_to_path(field_arg)
+                if fname is None:
+                    continue
+                if op_args is not None:
+                    base = f"{op.value}_{fname}"
+                    op_args[base] = {"fraction": float(fraction_arg)}
+                yield (op, fname)
                 continue
             for f in self._flatten_selections(inner):
                 fname = getattr(f, "name", None)
@@ -608,6 +653,7 @@ class AggregateBuilder:
         spec: list[tuple[str, Any]],
         requested: list[tuple[AggregateOp, str | None]],
         having_dict: dict[str, Any],
+        op_args: dict[str, dict[str, Any]] | None = None,
     ) -> int:
         """Total distinct group buckets matching the request, ignoring
         offset/limit.
@@ -648,7 +694,7 @@ class AggregateBuilder:
             return cqs.values(*group_aliases).distinct().count()
 
         agg_ann = _build_aggregate_annotations(
-            qs.model, requested, vendor,
+            qs.model, requested, vendor, op_args or {},
         )
         cqs = qs
         if group_ann:
@@ -664,6 +710,7 @@ class AggregateBuilder:
         aggregate_type: type,
         row: dict[str, Any],
         requested: list[tuple[AggregateOp, str | None]],
+        op_args: dict[str, dict[str, Any]] | None = None,
     ) -> Any:
         kwargs: dict[str, Any] = {"count": int(row.get("count", 0) or 0)}
         kwargs.update(
@@ -678,6 +725,11 @@ class AggregateBuilder:
             if op is AggregateOp.COUNT_DISTINCT and fp is not None:
                 cd[fp] = int(row.get(f"count_distinct_{fp}", 0) or 0)
         instance.__count_distinct__ = cd  # type: ignore[attr-defined]
+        # Stash percentile backing dicts keyed by ``(field, fraction)``
+        # so the method-style resolver can pull the right SQL alias —
+        # the alias was assigned via the fraction-derived suffix in
+        # :func:`compiler.aggregate_alias`, not by the bare field name.
+        self._populate_percentile_backing(instance, row, requested, op_args)
         return instance
 
     def _shape_grouped(
@@ -687,6 +739,7 @@ class AggregateBuilder:
         row: dict[str, Any],
         requested: list[tuple[AggregateOp, str | None]],
         spec: list[tuple[str, Any]],
+        op_args: dict[str, dict[str, Any]] | None = None,
     ) -> Any:
         key_kwargs: dict[str, Any] = {}
         for fp, grain in spec:
@@ -706,7 +759,55 @@ class AggregateBuilder:
                 grouped_type, row, requested,
             ),
         )
-        return grouped_type(**kwargs)
+        instance = grouped_type(**kwargs)
+        # Grouped types also expose method-style ops in v1.x, but for
+        # v1.0 the percentile fields are only on the top-level aggregate
+        # type — populate the backing dicts defensively so a future
+        # method-style addition Just Works™ without re-wiring the
+        # shaping path.
+        self._populate_percentile_backing(instance, row, requested, op_args)
+        return instance
+
+    @staticmethod
+    def _populate_percentile_backing(
+        instance: Any,
+        row: dict[str, Any],
+        requested: list[tuple[AggregateOp, str | None]],
+        op_args: dict[str, dict[str, Any]] | None,
+    ) -> None:
+        """Walk the requested ops, locate each percentile call's SQL
+        alias (which encodes the fraction), and stash the row value
+        in ``instance.__percentile_cont__`` /
+        ``instance.__percentile_disc__`` keyed by ``(field, fraction)``.
+        """
+        from strawberry_django_aggregates.compiler import (
+            aggregate_alias as _alias,
+        )
+        if op_args is None:
+            return
+        cont: dict[tuple[str, float], Any] = {}
+        disc: dict[tuple[str, float], Any] = {}
+        for op, fp in requested:
+            if fp is None:
+                continue
+            if op is AggregateOp.PERCENTILE_CONT:
+                base = f"{op.value}_{fp}"
+                args = op_args.get(base)
+                if not args or "fraction" not in args:
+                    continue
+                fraction = float(args["fraction"])
+                alias = _alias(op, fp, fraction=fraction)
+                cont[(fp, fraction)] = row.get(alias)
+            elif op is AggregateOp.PERCENTILE_DISC:
+                base = f"{op.value}_{fp}"
+                args = op_args.get(base)
+                if not args or "fraction" not in args:
+                    continue
+                fraction = float(args["fraction"])
+                alias = _alias(op, fp, fraction=fraction)
+                disc[(fp, fraction)] = row.get(alias)
+        instance.__percentile_cont__ = cont  # type: ignore[attr-defined]
+        instance.__percentile_disc__ = disc  # type: ignore[attr-defined]
 
     def _build_nested_op_kwargs(
         self,
@@ -716,11 +817,21 @@ class AggregateBuilder:
     ) -> dict[str, Any]:
         """Build ``{op_name: NestedFieldsType(...)}`` kwargs for the
         nested operator types attached to ``owner_type``.
+
+        ``COUNT``, ``COUNT_DISTINCT``, ``PERCENTILE_CONT``, and
+        ``PERCENTILE_DISC`` are method-style — they bind through
+        backing dicts on the instance, not the dataclass field map —
+        and are skipped here.
         """
         # Group requested aggregates by op.
         by_op: dict[AggregateOp, dict[str, Any]] = {}
         for op, fp in requested:
-            if op in {AggregateOp.COUNT, AggregateOp.COUNT_DISTINCT}:
+            if op in {
+                AggregateOp.COUNT,
+                AggregateOp.COUNT_DISTINCT,
+                AggregateOp.PERCENTILE_CONT,
+                AggregateOp.PERCENTILE_DISC,
+            }:
                 continue
             assert fp is not None
             by_op.setdefault(op, {})[fp] = row.get(f"{op.value}_{fp}")

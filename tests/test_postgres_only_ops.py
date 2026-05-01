@@ -25,6 +25,7 @@ from strawberry_django_aggregates.errors import (
     AggregateOp.VARIANCE,
     AggregateOp.STDDEV_POP,
     AggregateOp.VAR_POP,
+    AggregateOp.MODE,
     AggregateOp.ARRAY_AGG,
     AggregateOp.STRING_AGG,
 ])
@@ -35,6 +36,32 @@ def test_pg_only_op_raises_on_sqlite(sample_orders, op):
         compute_aggregation(
             Order.objects.all(),
             aggregates=[(op, "total")],
+        )
+    msg = str(exc_info.value)
+    assert op.value in msg
+    assert "sqlite" in msg.lower()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("op", [
+    AggregateOp.PERCENTILE_CONT,
+    AggregateOp.PERCENTILE_DISC,
+])
+def test_pg_only_percentile_raises_on_sqlite(sample_orders, op):
+    """Percentile ops require an ``op_args`` channel for the fraction
+    but the PG-only validation must fire before that lookup, so even a
+    well-formed call without ``op_args`` raises ``OperatorNotSupportedError``
+    rather than ``ValueError`` on SQLite. SPEC § 5 + § 5.1.
+    """
+    from tests.models import Order
+
+    with pytest.raises(OperatorNotSupportedError) as exc_info:
+        compute_aggregation(
+            Order.objects.all(),
+            aggregates=[(op, "total")],
+            op_args={
+                f"{op.value}_total": {"fraction": 0.5},
+            },
         )
     msg = str(exc_info.value)
     assert op.value in msg

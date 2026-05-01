@@ -16,25 +16,29 @@ class AggregateOp(StrEnum):
 
     Database support flags are documented in ``docs/SPEC.md``. The
     Postgres-only operators (``ARRAY_AGG``, ``STRING_AGG``, ``STDDEV``,
-    ``VARIANCE``, ``STDDEV_POP``, ``VAR_POP``) raise
+    ``VARIANCE``, ``STDDEV_POP``, ``VAR_POP``, ``PERCENTILE_CONT``,
+    ``PERCENTILE_DISC``, ``MODE``) raise
     :class:`OperatorNotSupportedError` at resolver entry on SQLite
     connections.
     """
 
-    COUNT          = "count"
-    COUNT_DISTINCT = "count_distinct"
-    SUM            = "sum"
-    AVG            = "avg"
-    MIN            = "min"
-    MAX            = "max"
-    STDDEV         = "stddev"          # Postgres only — sample stddev
-    VARIANCE       = "variance"        # Postgres only — sample variance
-    STDDEV_POP     = "stddev_pop"      # Postgres only — population stddev
-    VAR_POP        = "var_pop"         # Postgres only — population variance
-    BOOL_AND       = "bool_and"
-    BOOL_OR        = "bool_or"
-    ARRAY_AGG      = "array_agg"       # Postgres only
-    STRING_AGG     = "string_agg"      # Postgres only
+    COUNT           = "count"
+    COUNT_DISTINCT  = "count_distinct"
+    SUM             = "sum"
+    AVG             = "avg"
+    MIN             = "min"
+    MAX             = "max"
+    STDDEV          = "stddev"           # Postgres only — sample stddev
+    VARIANCE        = "variance"         # Postgres only — sample variance
+    STDDEV_POP      = "stddev_pop"       # Postgres only — population stddev
+    VAR_POP         = "var_pop"          # Postgres only — population variance
+    PERCENTILE_CONT = "percentile_cont"  # PG only — interpolated percentile
+    PERCENTILE_DISC = "percentile_disc"  # PG only — discrete percentile
+    MODE            = "mode"             # PG only — most-frequent value
+    BOOL_AND        = "bool_and"
+    BOOL_OR         = "bool_or"
+    ARRAY_AGG       = "array_agg"        # Postgres only
+    STRING_AGG      = "string_agg"       # Postgres only
 
 
 # Operators each Django field type gets without explicit override.
@@ -48,11 +52,16 @@ _NUMERIC_OPS = (
     AggregateOp.VARIANCE,
     AggregateOp.STDDEV_POP,
     AggregateOp.VAR_POP,
+    AggregateOp.PERCENTILE_CONT,
+    AggregateOp.PERCENTILE_DISC,
+    AggregateOp.MODE,
 )
 
 _DATE_OPS = (
     AggregateOp.MIN,
     AggregateOp.MAX,
+    AggregateOp.PERCENTILE_DISC,
+    AggregateOp.MODE,
 )
 
 _BOOL_OPS = (
@@ -63,6 +72,7 @@ _BOOL_OPS = (
 _STRING_OPS = (
     AggregateOp.MIN,
     AggregateOp.MAX,
+    AggregateOp.MODE,
     AggregateOp.ARRAY_AGG,
     AggregateOp.STRING_AGG,
 )
