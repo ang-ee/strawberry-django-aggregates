@@ -570,6 +570,101 @@ so the resolver passes that same value plus `week_start` to
 parameter is validated for fail-loud feedback when callers use the
 helper directly.
 
+### 7.2 · Empty-bucket filling
+
+`compute_aggregation(..., fill=True)` returns a *dense* bucket spine —
+every contiguous bucket between the data's min and max appears in the
+output, with `count: 0` and all measures `None` for buckets that had
+no underlying rows. Mirrors the Hasura `fill` argument and the Apache
+Superset "show empty buckets" toggle; closes a long-standing reporting
+ergonomics gap (sparse line charts that mis-render gaps as zero
+slopes, etc.).
+
+```python
+compute_aggregation(
+    Order.objects.all(),
+    group_by=[("created_at", TimeGranularity.MONTH)],
+    aggregates=[(AggregateOp.COUNT, None), (AggregateOp.SUM, "total")],
+    fill=True,
+)
+# → [
+#     {"created_at_month": ..., "count": 5, "sum_total": Decimal(...)},
+#     {"created_at_month": ..., "count": 0, "sum_total": None},  # filled
+#     ...
+# ]
+```
+
+**v1.0 restriction — single TIME-granularity bucket.** The `group_by`
+spec MUST contain *exactly one* entry whose granularity is a
+`TimeGranularity` member. Multi-level group_by + fill (e.g. fill the
+month spine independently per `customer_id`) is a v1.x feature; v1.0
+raises `AggregateError` with a message naming the restriction. Empty
+`group_by`, multiple TIME-granularity entries, `NumberGranularity`,
+and non-granular entries all raise.
+
+**HAVING runs BEFORE fill.** When the caller supplies a `having`
+dict, HAVING is applied to the populated rows first; the spine is then
+derived from the post-HAVING data range and filled with zero-count
+rows where appropriate. Filled rows have `count = 0` and all measures
+`None`, so they wouldn't satisfy any HAVING comparison anyway — but
+the ordering matters because:
+
+- A populated bucket whose aggregate doesn't pass HAVING is *removed*
+  and is NOT back-filled with a zero row.
+- A bucket between two HAVING-passing buckets IS filled.
+
+Example: orders in January (sum=100), March (sum=200), and June
+(sum=400). With `having={"sum_total__gt": 150}` and `fill=True`:
+
+- January is filtered out by HAVING.
+- March, April, May, June appear — March/June populated, April/May
+  filled with `count: 0`.
+- The spine starts at March (post-HAVING data min), not January.
+
+Callers who want the spine to extend over the *original* data range
+must pass an explicit `fill_min` / `fill_max`.
+
+**Composition with `order_by` and `offset` / `limit`.** Filled rows
+sort ascending by the bucket alias by default. An explicit `order_by`
+re-applies on the filled list (Python-side stable sort). `offset` and
+`limit` both apply AFTER fill — pagination over the dense spine, not
+over the populated rows. Counting the same way: `totalCount` reflects
+the dense bucket count, not the populated-row count.
+
+**`fill_min` / `fill_max` overrides.** Both default to `None`. When
+either is `None`, that endpoint is derived from the data (post-HAVING
+when HAVING is in play, otherwise the queryset's raw min/max). Both
+endpoints are floored to the granularity bucket they sit in — callers
+can pass arbitrary "now"-style datetimes without `date_trunc`'ing
+first. Passing `fill_min` / `fill_max` without `fill=True` raises
+`AggregateError` (silent ignore would be a footgun).
+
+**Implementation strategy.** Post-process Python merge over the
+populated rows rather than SQL `generate_series` + `LATERAL JOIN`.
+Reasons: works uniformly on PostgreSQL and SQLite (no vendor-specific
+SQL); easier to test and audit; `generate_series` + LEFT JOIN
+interacts badly with HAVING; cardinality is bounded for analytics
+shapes.
+
+**GraphQL surface.**
+
+```graphql
+ordersGroupBy(
+  groupBy: [{ field: CREATED_AT, granularity: MONTH }]
+  fill: true
+  fillMin: "2026-01-01T00:00:00+00:00"
+  fillMax: "2026-12-31T00:00:00+00:00"
+) {
+  results { key { createdAtMonth createdAtMonthRange { from to } } count }
+  totalCount
+}
+```
+
+`fill: Boolean = false`, `fillMin: DateTime`, `fillMax: DateTime` are
+emitted unconditionally on every grouped resolver — no flag — so the
+SDL stays stable. Bound validation and TIME-granularity restriction
+enforcement happen at resolver entry, before any SQL fires.
+
 ### Timezone correctness
 
 Critical detail Odoo got right (`odoo/models.py:2685–2727`) and we copy verbatim. From the implementation:
