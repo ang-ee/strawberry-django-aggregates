@@ -85,7 +85,7 @@ type OrderGrouped {
 
 ## Status
 
-Stable (v1.0). Operator vocabulary, SDL emission, granularity tracks, and the `compute_aggregation` signature are part of the SemVer surface — see [`docs/SPEC.md`](./docs/SPEC.md) § 16. Runtime: Python 3.13, Django 6.0.
+Beta (v0.2.1). The schema shape, operator vocabulary, and `compute_aggregation` signature are stable for early adopters, but minor-level iteration is still expected before a 1.0 stability commitment — see [`docs/SPEC.md`](./docs/SPEC.md) § 16. Runtime: Python 3.13, Django 6.0.
 
 ## Documentation
 

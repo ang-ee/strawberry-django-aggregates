@@ -309,7 +309,7 @@ wheels = [
 
 [[package]]
 name = "strawberry-django-aggregates"
-version = "1.0.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "django" },
