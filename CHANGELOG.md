@@ -1,8 +1,27 @@
 # Changelog
 
 All notable changes to `strawberry-django-aggregates` are documented here.
-The project follows [Semantic Versioning](https://semver.org/) starting at
-v1.0.0; see `docs/SPEC.md` § 16 for the SemVer surface.
+The project follows [Semantic Versioning](https://semver.org/).
+During `0.x`, minor releases may include controlled breaking changes.
+
+
+## [0.2.1] — 2026-05-02
+
+### Changed
+
+- Aligned project maturity and release messaging to a beta `0.x` line
+  (`README.md`, `pyproject.toml`, changelog framing).
+- Added canonical terminology documentation for API/wire/operator naming
+  consistency.
+- Added contributor quality-gate documentation with exact local verification
+  commands.
+- Added CI workflow with explicit SQLite + PostgreSQL matrix coverage and
+  deterministic quality gates (`ruff`, `mypy`, `pytest`).
+
+### Notes
+
+- This is a quality/documentation/process alignment release; no new runtime
+  feature surface was introduced in this patch.
 
 ## [1.0.0] — 2026-05-01
 

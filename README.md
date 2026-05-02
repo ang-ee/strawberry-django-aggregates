@@ -86,11 +86,15 @@ type OrderGrouped {
 
 ## Status
 
-Alpha. The schema shape, operator vocabulary, and `compute_aggregation` signature are stable. Builder ergonomics may evolve in 0.2.
+Beta (v0.2.1). The schema shape and backend primitive are stable for early adopters, but minor-level iteration is still expected before a 1.0 stability commitment.
 
 ## Documentation
 
-See [`docs/SPEC.md`](./docs/SPEC.md) for the full contract — operator catalog, granularity tracks, HAVING semantics, ordering rules, timezone handling, and the Odoo-derived footgun audit.
+- Contract/spec: [`docs/SPEC.md`](./docs/SPEC.md)
+- Naming and wire vocabulary: [`docs/TERMINOLOGY.md`](./docs/TERMINOLOGY.md)
+- Upgrade notes: [`docs/MIGRATING.md`](./docs/MIGRATING.md)
+- Roadmap (debt/quality only): [`docs/ROADMAP.md`](./docs/ROADMAP.md)
+- Contributor quality gate: [`CONTRIBUTING.md`](./CONTRIBUTING.md)
 
 ## License
 
