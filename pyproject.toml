@@ -3,7 +3,7 @@ name            = "strawberry-django-aggregates"
 version         = "0.2.1"
 description     = "Hasura-shape aggregations over Django querysets in Strawberry GraphQL — count, sum, avg, min, max, stddev, variance, array_agg + Odoo-grade group-by with timezone-correct date bucketing."
 readme          = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 license         = { text = "BSD-3-Clause" }
 authors         = [{ name = "strawberry-django-aggregates maintainers" }]
 keywords        = [
@@ -18,7 +18,7 @@ classifiers     = [
   "License :: OSI Approved :: BSD License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Database",
   "Topic :: Internet :: WWW/HTTP",
   "Typing :: Typed",
@@ -61,7 +61,7 @@ exclude = ["tests*", "docs*"]
 
 [tool.ruff]
 line-length    = 79
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
