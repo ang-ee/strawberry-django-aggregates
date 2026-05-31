@@ -59,3 +59,31 @@ class OrderItem(models.Model):
 
     class Meta:
         app_label = "tests"
+
+
+class Task(models.Model):
+    """Exercises choices-backed group-by enum emission edge cases.
+
+    - ``priority`` uses plain integer ``choices`` — the emitted enum
+      member names cannot start with a digit, so they are derived from
+      the labels (``1 / "Low"`` -> ``LOW``).
+    - ``effort`` is a plain ``IntegerField`` with no choices — it must
+      keep its ``Int`` scalar on the group key.
+
+    The django-choices-field ``choices_enum`` (name != value) path is
+    exercised in ``test_choices_group_key`` by attaching a ``choices_enum``
+    attribute to a plain field — the library reads it via ``getattr`` and
+    does NOT depend on ``django-choices-field``.
+    """
+
+    PRIORITY_CHOICES = [
+        (1, "Low"),
+        (2, "Medium"),
+        (3, "High"),
+    ]
+
+    priority = models.IntegerField(choices=PRIORITY_CHOICES, default=1)
+    effort   = models.IntegerField(default=0)
+
+    class Meta:
+        app_label = "tests"

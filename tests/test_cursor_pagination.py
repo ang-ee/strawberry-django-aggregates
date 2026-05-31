@@ -429,7 +429,16 @@ def test_cursor_pagination_decodes_to_canonical_keys(
     primary key). The cursor preserves the native int — clients
     decoding cursors should compare via ``str()`` if they want to
     match the wire-side ``customerId``.
+
+    Likewise, ``status`` is a ``choices`` column: the wire serializes
+    the GraphQL enum member NAME (``"PAID"``), while the cursor — a
+    keyset over the RAW stored group-by values — carries the stored
+    value (``"paid"``). Both reference the same group; resolve the raw
+    value through the emitted ``OrderStatus`` enum to recover the name.
     """
+    from strawberry_django_aggregates.types import _choices_enum_for
+    from tests.models import Order
+
     schema = six_buckets_schema
     page = _page(schema, first=2)
     edge = page["edges"][0]
@@ -438,7 +447,11 @@ def test_cursor_pagination_decodes_to_canonical_keys(
     # Compare as strings — the cursor carries the int; the GraphQL ID
     # serializes as a string. Both reference the same underlying value.
     assert str(decoded[0]) == edge["node"]["key"]["customerId"]
-    assert decoded[1] == edge["node"]["key"]["status"]
+    # The cursor carries the raw stored status (``"paid"``); the wire
+    # serializes the enum member NAME (``"PAID"``). Map the raw value
+    # through the same enum the library emitted to compare.
+    status_enum = _choices_enum_for(Order._meta.get_field("status"), "Order")
+    assert status_enum(decoded[1]).name == edge["node"]["key"]["status"]
 
 
 def test_cursor_pagination_first_zero_returns_no_edges(

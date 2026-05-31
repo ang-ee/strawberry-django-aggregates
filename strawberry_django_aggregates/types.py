@@ -37,6 +37,10 @@ import strawberry
 import strawberry.federation
 from strawberry_django.pagination import OffsetPaginationInfo
 
+from strawberry_django_aggregates.errors import (
+    ChoicesEnumCollisionError,
+    ChoicesEnumNameError,
+)
 from strawberry_django_aggregates.granularity import (
     NumberGranularity,
     TimeGranularity,
@@ -302,6 +306,157 @@ def _natural_python_type(field: Field) -> Any:
     return str
 
 
+# ---------------------------------------------------------------------------
+# choices-backed group-by enums
+# ---------------------------------------------------------------------------
+#
+# A ``choices=[(value, label), ...]`` group-by column carries an enum on
+# the wire — losing it to the base ``String`` / ``Int`` scalar throws
+# away the typed surface clients expect. We build our OWN deterministic
+# ``enum.Enum`` and ``strawberry.enum()`` it; we never decorate the
+# user's ``choices_enum`` class (it stays untouched and reusable).
+#
+# The built Strawberry enum is cached per ``(prefix, field.name)`` so two
+# builds in one process return the SAME object — required for determinism
+# (CLAUDE.md Critical Rule 2) and to avoid Strawberry duplicate-type
+# errors when the same model is built twice.
+#
+# The cache relies on ``prefix`` being unique per emitted type — the same
+# invariant the rest of the type emitter already depends on (two models
+# sharing a prefix would collide on every emitted type name, not just the
+# enum). First write for a given key wins for the process lifetime. See
+# SPEC § 4.3.
+
+_CHOICES_ENUM_CACHE: dict[tuple[str, str], type[enum.Enum]] = {}
+
+# Identifier alphabet for sanitized enum member names — uppercase only
+# (callers uppercase first), digits, and underscore. Anything else maps
+# to ``_``.
+_MEMBER_NAME_ALPHABET: frozenset[str] = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_",
+)
+
+
+def _pascal_case(name: str) -> str:
+    """``"status"`` → ``"Status"``; ``"order_status"`` → ``"OrderStatus"``."""
+    return "".join(part.capitalize() for part in name.split("_"))
+
+
+def _sanitize_member_name(raw: str) -> str:
+    """Uppercase ``raw`` and replace each non-identifier char with ``_``.
+
+    Mirrors GraphQL / Python enum member-name rules: ``[A-Za-z0-9_]``
+    only. The result may still be empty or digit-leading — the caller
+    decides whether to fall back to the label.
+    """
+    return "".join(
+        ch if ch in _MEMBER_NAME_ALPHABET else "_"
+        for ch in raw.upper()
+    )
+
+
+def _choices_enum_for(
+    field: Field, prefix: str,
+) -> type[enum.Enum] | None:
+    """Build (and cache) a Strawberry enum for a choices group-by field.
+
+    Returns ``None`` when the field is date / datetime / time (those keep
+    the bucketed-scalar behaviour) or has no ``choices`` — the caller
+    then falls back to :func:`_natural_python_type`.
+
+    When the field exposes a django-choices-field ``choices_enum`` (a
+    Python enum class), its member **names and values are reused
+    verbatim** — critical when a member's name differs from its value
+    (``IN_PROGRESS = "wip"``). Otherwise the plain
+    ``choices=[(value, label), ...]`` list is synthesized into an enum
+    whose member values are the stored choice values and whose member
+    names are derived deterministically from the value (or, for empty /
+    digit-leading values such as integer choices, from the label).
+
+    A name collision between two members raises
+    :class:`ChoicesEnumCollisionError` (fail-loud) — we never silently
+    deduplicate.
+
+    The emitted GraphQL type is named ``f"{prefix}{PascalCase(field.name)}"``
+    (e.g. ``OrderStatus``) and cached per ``(prefix, field.name)``.
+
+    Reads ``field.choices_enum`` via ``getattr`` only — the library has
+    no dependency on django-choices-field.
+    """
+    if type(field).__name__ in {"DateField", "DateTimeField", "TimeField"}:
+        return None
+    if not field.choices:
+        return None
+
+    cache_key = (prefix, field.name)
+    cached = _CHOICES_ENUM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    type_name = f"{prefix}{_pascal_case(field.name)}"
+
+    choices_enum = getattr(field, "choices_enum", None)
+    members: list[tuple[str, Any]]
+    if isinstance(choices_enum, type) and issubclass(choices_enum, enum.Enum):
+        # django-choices-field: reuse member names + values verbatim so
+        # name≠value pairs survive. Build a fresh enum (never decorate
+        # the user's class).
+        members = [(m.name, m.value) for m in choices_enum]
+    else:
+        # Plain ``choices=[(value, label), ...]``. Derive each member
+        # name from the value; fall back to the label when the value
+        # sanitizes to an empty or digit-leading name (e.g. integer
+        # choices ``1 / "One"`` → ``ONE``).
+        members = []
+        seen_names: dict[str, Any] = {}
+        seen_values: dict[Any, str] = {}
+        for value, label in field.choices:
+            member_name = _sanitize_member_name(str(value))
+            if not member_name or member_name[0].isdigit():
+                member_name = _sanitize_member_name(str(label))
+            # Neither the value nor the label yields a legal member name
+            # (empty or digit-leading). ``enum.Enum`` would raise a bare
+            # ``ValueError`` — fail loud with a typed, actionable error.
+            if not member_name or member_name[0].isdigit():
+                raise ChoicesEnumNameError(
+                    f"Choices field {field.name!r} on {prefix!r} has a "
+                    f"choice (value {value!r}, label {label!r}) whose "
+                    "value and label both sanitize to an empty or "
+                    f"digit-leading enum member name {member_name!r}. "
+                    "Rename the label or supply a django-choices-field "
+                    "`choices_enum` with explicit member names.",
+                )
+            if member_name in seen_names:
+                raise ChoicesEnumCollisionError(
+                    f"Choices field {field.name!r} on {prefix!r} has two "
+                    f"members deriving the same enum name "
+                    f"{member_name!r} (values "
+                    f"{seen_names[member_name]!r} and {value!r}). "
+                    "Rename the colliding choice or supply a "
+                    "django-choices-field `choices_enum` with explicit "
+                    "member names.",
+                )
+            # Two choices sharing a stored value would make ``enum.Enum``
+            # silently alias the second to the first, dropping it from the
+            # schema. Refuse — fail-loud (Critical Rules 2 / 6).
+            if value in seen_values:
+                raise ChoicesEnumCollisionError(
+                    f"Choices field {field.name!r} on {prefix!r} has two "
+                    f"members sharing the stored value {value!r} (names "
+                    f"{seen_values[value]!r} and {member_name!r}). Remove "
+                    "the duplicate choice or supply a django-choices-field "
+                    "`choices_enum` with explicit member names.",
+                )
+            seen_names[member_name] = value
+            seen_values[value] = member_name
+            members.append((member_name, value))
+
+    enum_cls = enum.Enum(type_name, members)  # type: ignore[misc]
+    built: type[enum.Enum] = strawberry.enum(enum_cls)
+    _CHOICES_ENUM_CACHE[cache_key] = built
+    return built
+
+
 def _aggregate_python_type(op: AggregateOp, field: Field) -> Any:
     """Output Python type for ``(op, field)`` — drives nested-type fields."""
     if op in {AggregateOp.MIN, AggregateOp.MAX}:
@@ -510,6 +665,13 @@ def _make_dataclass(
         else (n, t)
         for (n, t, d) in fields
     ]
+    # ``make_dataclass`` stores each field's annotation as the real type
+    # OBJECT handed to it, not a source string — ``from __future__ import
+    # annotations`` (PEP 563) only stringifies annotations *written as
+    # source* in a module, never objects passed at runtime. So a
+    # dynamically built per-model type (e.g. a choices enum like
+    # ``OrderStatus``) round-trips through Strawberry by identity, with no
+    # name-resolution step that could fall back to the base scalar.
     return dataclasses.make_dataclass(name, dc_fields)
 
 
@@ -982,13 +1144,24 @@ def _emit_group_key(
             continue
 
         field = model._meta.get_field(field_name)
-        py_type = _natural_python_type(field)  # type: ignore[arg-type]
         # FK fields surface as `<name>_id` per SPEC § 4.
         if getattr(field, "many_to_one", False):
+            py_type = _natural_python_type(field)  # type: ignore[arg-type]
             fk_id_name = f"{field_name}_id"
             key_fields.append((fk_id_name, (py_type | None), None))
             fk_field_names.append(fk_id_name)
         else:
+            # A ``choices``-backed (non-date) column carries a GraphQL
+            # enum, not its base scalar — preserve the typed surface.
+            # ``_choices_enum_for`` returns ``None`` for date/datetime
+            # and non-choices fields, in which case we keep the natural
+            # scalar from ``_natural_python_type``.
+            choices_enum = _choices_enum_for(field, name)  # type: ignore[arg-type]
+            py_type = (
+                choices_enum
+                if choices_enum is not None
+                else _natural_python_type(field)  # type: ignore[arg-type]
+            )
             key_fields.append((field_name, (py_type | None), None))
 
         # Date/datetime fields: emit per-granularity bucket aliases

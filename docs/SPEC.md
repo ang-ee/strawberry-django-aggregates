@@ -121,7 +121,7 @@ type OrderGroupedResult {
 
 type OrderGroupKey {
   customerId:       ID
-  status:           OrderStatusEnum
+  status:           OrderStatus   # choices column → typed enum, see § 4.3
   createdAt:        DateTime      # bucketed if granularity arg used
   createdAtMonth:   DateTime      # populated when groupBy uses MONTH granularity
   createdAtMonthRange: BucketRange  # half-open [from, to) sibling — TIME granularity only
@@ -291,6 +291,37 @@ Clients then issue:
 The dataloader approach is a separate engineering task — it requires pre-walking the GraphQL selection at parent-list time so the batched child query annotates the correct measures. Out of scope for v1.0; the per-row implementation is a clean fallback path that batched implementations can defer to when batching is impossible (e.g. when the filter argument's value differs per parent row, which `compute_aggregation` cannot handle in a single query).
 
 **Determinism.** Re-registering the same `(parent_type, relation_name, child_built)` tuple replaces the existing field by `python_name` — the cached `StrawberryObjectDefinition.fields` list is deduplicated before append. Two builds of the same schema produce byte-identical SDL.
+
+### 4.3 · Choices-backed group-by enums
+
+A `group_by` field declared with Django `choices` carries a closed vocabulary, so its `<Model>GroupKey` column is emitted as a GraphQL **enum** rather than its base scalar (`String` / `Int`). Dropping it to the scalar throws away the typed surface clients expect and silently accepts values outside the vocabulary.
+
+```graphql
+type OrderGroupKey {
+  status: OrderStatus     # NOT String — the choices vocabulary, typed
+}
+
+enum OrderStatus { DRAFT, PAID, CANCELLED }
+```
+
+**Type name.** `f"{prefix}{PascalCase(field.name)}"` — `Order` + `status` → `OrderStatus`. No redundant `Enum` suffix. The enum is built once and cached per `(prefix, field.name)`, so the type emitter and the resolver share the **same** object — required for determinism (Critical Rule 2) and because Strawberry rejects duplicate type registrations. `prefix` is the builder's `name_prefix` (defaulting to `model.__name__`), which is already required to be unique per emitted type, so the cache key is unambiguous.
+
+**Member derivation.**
+
+- **django-choices-field** (`TextChoicesField` / `IntegerChoicesField`, detected by a `choices_enum` attribute read via `getattr` — the library has **no dependency** on the package): member **names and values are reused verbatim**, so a member whose name differs from its value (`IN_PROGRESS = "wip"`) survives.
+- **Plain `choices=[(value, label), ...]`**: each member name is derived from the stored value (uppercased, non-`[A-Z0-9_]` → `_`), falling back to the label when the value sanitizes to an empty or digit-leading name (integer choices `1 / "Low"` → `LOW`). The member value is always the stored choice value.
+
+**Date / datetime / time choices are excluded** — those keep the bucketed-scalar behaviour of § 7; the enum derivation returns `None` for them regardless of `choices`. FK columns (surfaced as `<name>_id`) and JSON-path columns are likewise never enum-coerced.
+
+**Resolver coercion.** Grouped rows carry the **raw** stored value (`"paid"`); the resolver coerces it to the matching enum member, so the wire serializes the member **name** (`"PAID"`). `None` stays `None`. The cursor-pagination keyset (§ 4.1) operates on the raw stored values — a cursor carries `"paid"` while the wire shows `"PAID"`; both name the same group, and a decoded cursor is mapped back through the emitted enum to recover the wire name.
+
+**Fail-loud (Critical Rules 2 / 3 / 6).** The vocabulary is the contract, so ambiguity is refused rather than silently dropped:
+
+- Two choices deriving the same member **name**, or sharing the same stored **value** (which `enum.Enum` would silently alias), raise `ChoicesEnumCollisionError`.
+- A choice whose value **and** label both sanitize to an empty or digit-leading name raises `ChoicesEnumNameError`.
+- A grouped row whose stored value is **not** among the field's choices — legal in Django, since `choices` is validation, not a DB constraint — raises `ChoicesValueNotInEnumError` at coercion, naming the field, value, and enum, rather than surfacing a bare `ValueError` mid-serialization.
+
+All three derive from `AggregateError` and are re-exported from the package root. The escape hatch for every collision/name case is the same: supply a django-choices-field `choices_enum` with explicit member names.
 
 ## 5 · Aggregate operator vocabulary
 

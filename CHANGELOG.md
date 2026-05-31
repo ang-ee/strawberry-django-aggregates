@@ -5,6 +5,37 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.3.0] — 2026-05-31
+
+### Added
+
+- **Choices-backed group-by enums.** A `group_by` field declared with
+  Django `choices` now surfaces on `<Model>GroupKey` as a typed GraphQL
+  enum (`OrderStatus`) instead of its base `String` / `Int` scalar, and the
+  grouped resolver coerces each row's raw stored value to the matching enum
+  member (the wire serializes the member name, e.g. `"PAID"`). Member names
+  derive from a django-choices-field `choices_enum` verbatim when present
+  (read via `getattr` — no dependency on the package), otherwise from the
+  stored value, falling back to the label for empty / digit-leading values
+  (integer choices `1 / "Low"` → `LOW`). The enum is built deterministically
+  and cached per `(prefix, field.name)`. Date / datetime / time, FK, and
+  JSON-path columns are unaffected. SPEC § 4.3.
+- **`ChoicesEnumCollisionError`, `ChoicesEnumNameError`,
+  `ChoicesValueNotInEnumError`** — new fail-loud errors in the
+  `AggregateError` hierarchy, re-exported from the package root. Raised,
+  respectively, when two choices collapse to the same member name or stored
+  value, when no legal member name can be derived, and when a stored row
+  value is outside the field's declared choices.
+
+### Changed
+
+- **(Controlled breaking, SDL.)** `<Model>GroupKey` columns for `choices`
+  fields change type from `String` / `Int` to the per-field enum. Consumers
+  that grouped by a choices column now receive the enum member name on the
+  wire rather than the raw stored value. Cursor-pagination keysets still
+  operate on the raw stored values (§ 4.1), so decoded cursors map back
+  through the emitted enum to recover the wire name.
+
 ## [0.2.2] — 2026-05-09
 
 ### Fixed

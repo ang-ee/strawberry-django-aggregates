@@ -37,7 +37,10 @@ from strawberry_django_aggregates.compiler import (
     compute_aggregation,
     group_by_alias,
 )
-from strawberry_django_aggregates.errors import OrderFieldNotAllowed
+from strawberry_django_aggregates.errors import (
+    ChoicesValueNotInEnumError,
+    OrderFieldNotAllowed,
+)
 from strawberry_django_aggregates.granularity import (
     NumberGranularity,
     TimeGranularity,
@@ -55,6 +58,7 @@ from strawberry_django_aggregates.pagination import (
 )
 from strawberry_django_aggregates.types import (
     BucketRange,
+    _choices_enum_for,
     make_aggregate_type,
     make_group_by_spec,
     make_group_order_input,
@@ -1460,6 +1464,42 @@ class AggregateBuilder:
                     fp, grain, field,  # type: ignore[arg-type]
                 )
             value = row.get(alias)
+            # A ``choices``-backed group-by column is typed as a GraphQL
+            # enum on ``<Model>GroupKey`` (see ``types._choices_enum_for``);
+            # the compiler row carries the raw stored value, so coerce it
+            # to the matching enum member here. ``None`` stays ``None``;
+            # FK / date / non-choices columns return ``None`` from the
+            # helper and pass through unchanged. The field→enum mapping is
+            # single-sourced in ``types.py`` (cached), so this returns the
+            # SAME enum object the type emitter used.
+            if (
+                value is not None
+                and grain is None
+                and not (self.json_paths and fp in self.json_paths)
+                and not getattr(field, "many_to_one", False)
+            ):
+                key_name = self.name_prefix or self.model.__name__
+                choices_enum = _choices_enum_for(
+                    field, key_name,  # type: ignore[arg-type]
+                )
+                if choices_enum is not None:
+                    try:
+                        value = choices_enum(value)
+                    except ValueError as exc:
+                        # ``choices`` is a Django form/validation concern,
+                        # not a DB constraint — a column may legally hold
+                        # a value no longer in the declared choices. Fail
+                        # loud with field + value + enum rather than let a
+                        # bare ValueError surface mid-serialization.
+                        raise ChoicesValueNotInEnumError(
+                            f"Group-by field {fp!r} on "
+                            f"{self.model.__name__!r} has a stored value "
+                            f"{value!r} that is not among the field's "
+                            f"choices (enum {choices_enum.__name__!r}). "
+                            "Clean the data, re-add the value to "
+                            "`choices`, or exclude the affected rows via "
+                            "the caller's queryset.",
+                        ) from exc
             key_kwargs[alias] = value
             # TIME granularity: emit the half-open ``[from, to)``
             # interval as a sibling ``<alias>_range: BucketRange`` per
