@@ -5,6 +5,26 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.4.1] — 2026-06-02
+
+### Fixed
+
+- **Grouped filter echo now emits the enum wire name for enum-typed
+  lookups.** 0.4.0 echoed a `choices` column's stored value (`draft`)
+  unconditionally. That is correct for strawberry-django's default string
+  lookup (`StrFilterLookup`, which matches the stored value), but a column
+  exposed as a GraphQL **enum** filter input (a django-choices-field
+  column, or an explicit `FilterLookup[SomeEnum]`) expects the enum
+  **wire name** (`DRAFT`) — a stored string fails enum-input validation
+  and re-selects nothing. The echo now resolves the lookup field's actual
+  strawberry type: an enum-typed lookup maps the bucket's stored value to
+  the filter enum's wire name (`{stored: name}` read from the resolved
+  `StrawberryEnumDefinition`), while a string lookup keeps the stored
+  value. Time (`gte`/`lt` → ISO-8601), foreign-key (`pk`), `is_null`, and
+  `Decimal` (→ string) axes are unchanged. SPEC § 4.4. Round-trip tests
+  cover both the string-lookup and enum-lookup paths, including a filter
+  enum whose member names diverge from the group key's.
+
 ## [0.4.0] — 2026-06-02
 
 ### Added

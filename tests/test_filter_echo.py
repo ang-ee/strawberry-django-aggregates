@@ -15,6 +15,8 @@ from decimal import Decimal
 import pytest
 import strawberry
 import strawberry_django
+from django.db import models
+from strawberry_django.fields.filter_types import FilterLookup
 
 from strawberry_django_aggregates import AggregateBuilder, FilterEchoError
 from tests.models import Order
@@ -39,6 +41,41 @@ class OrderFilterNoCustomer:
     """
     status:     strawberry.auto
     created_at: strawberry.auto
+
+
+@strawberry.enum
+class StatusEnum(models.TextChoices):
+    # A choices vocabulary exposed as a GraphQL enum input — wire names
+    # (DRAFT) differ from the stored values (draft). TextChoices members
+    # are str-comparable so Django filtering matches stored rows.
+    DRAFT = "draft", "Draft"
+    PAID = "paid", "Paid"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+@strawberry_django.filter_type(Order, lookups=True)
+class OrderEnumFilter:
+    """`status` typed as a GraphQL **enum** lookup (e.g. a
+    django-choices-field column) rather than a plain string lookup.
+    """
+    status:     FilterLookup[StatusEnum] | None
+    created_at: strawberry.auto
+
+
+@strawberry.enum
+class StatusAliasEnum(models.TextChoices):
+    # Member NAMES deliberately diverge from the aggregates-derived group
+    # key names (PAID / DRAFT / CANCELLED) for the SAME stored values, so
+    # a test can prove the echo emits the FILTER enum's wire name (keyed
+    # on the stored value), not the group key's name.
+    PENDING = "paid", "Paid"
+    INITIAL = "draft", "Draft"
+    VOID = "cancelled", "Cancelled"
+
+
+@strawberry_django.filter_type(Order, lookups=True)
+class OrderAliasFilter:
+    status: FilterLookup[StatusAliasEnum] | None
 
 
 @strawberry_django.type(Order)
@@ -308,6 +345,116 @@ def test_echo_roundtrip_reselects_bucket_rows(
             f"echoed filter {r['filter']} re-selected "
             f"{len(replayed.data['orders'])} rows, expected {r['count']}"
         )
+
+
+def test_enum_typed_lookup_echoes_wire_name(echo_orders):
+    """When the list filter types a choices column as a GraphQL **enum**
+    input, the echo emits the enum WIRE NAME (`DRAFT`), not the stored
+    value (`draft`) — otherwise it fails enum-input validation and
+    re-selects nothing. The string-lookup round-trip above proves the
+    opposite case still emits the stored value.
+    """
+    built = AggregateBuilder(
+        model=Order,
+        aggregate_fields=["total"],
+        group_by_fields=["status", "created_at"],
+        filter_type=OrderEnumFilter,
+        enable_filter_echo=True,
+    ).build()
+
+    @strawberry.type
+    class Query:
+        orders_group_by: built.grouped_result_type = built.group_by_field
+
+    schema = strawberry.Schema(query=Query)
+    grouped = schema.execute_sync("""
+        query {
+            ordersGroupBy(groupBy: [{ field: STATUS }]) {
+                results { key { status } count filter }
+            }
+        }
+    """)
+    assert grouped.errors is None, grouped.errors
+    rows = grouped.data["ordersGroupBy"]["results"]
+    assert rows
+    for r in rows:
+        # Wire name (e.g. PAID), matching the enum-serialized group key —
+        # NOT the stored value (paid).
+        echoed = r["filter"]["status"]["exact"]
+        assert echoed == r["key"]["status"]
+        assert echoed.isupper()
+
+    # Round-trip through an enum-typed list filter: the echoed name must
+    # be a valid enum input AND re-select exactly the bucket's rows.
+    @strawberry.type
+    class ListQuery:
+        orders: list[OrderRow] = strawberry_django.field(
+            filters=OrderEnumFilter,
+        )
+
+    list_schema = strawberry.Schema(query=ListQuery)
+    for r in rows:
+        replayed = list_schema.execute_sync(
+            "query($f: OrderEnumFilter!) { orders(filters: $f) { id } }",
+            variable_values={"f": r["filter"]},
+        )
+        assert replayed.errors is None, (r["filter"], replayed.errors)
+        assert len(replayed.data["orders"]) == r["count"]
+
+
+def test_enum_lookup_uses_filter_enum_name_not_key_name(echo_orders):
+    """The echoed name comes from the FILTER enum (keyed on the bucket's
+    stored value), not the group key's enum. Here the two enums assign
+    DIFFERENT names to the same stored value (`paid` → key `PAID`, filter
+    `PENDING`), so mirroring the key would emit the wrong — and
+    invalid — name. Guards against a regression to key-mirroring.
+    """
+    built = AggregateBuilder(
+        model=Order,
+        aggregate_fields=["total"],
+        group_by_fields=["status"],
+        filter_type=OrderAliasFilter,
+        enable_filter_echo=True,
+    ).build()
+
+    @strawberry.type
+    class Query:
+        orders_group_by: built.grouped_result_type = built.group_by_field
+
+    schema = strawberry.Schema(query=Query)
+    grouped = schema.execute_sync("""
+        query {
+            ordersGroupBy(groupBy: [{ field: STATUS }]) {
+                results { key { status } count filter }
+            }
+        }
+    """)
+    assert grouped.errors is None, grouped.errors
+    rows = grouped.data["ordersGroupBy"]["results"]
+    assert rows
+    stored_to_wire = {"paid": "PENDING", "draft": "INITIAL",
+                      "cancelled": "VOID"}
+    for r in rows:
+        echoed = r["filter"]["status"]["exact"]
+        # The echoed name is the FILTER enum's, which differs from the
+        # group key's serialized name for the same stored value.
+        assert echoed != r["key"]["status"]
+        assert echoed in set(stored_to_wire.values())
+
+    @strawberry.type
+    class ListQuery:
+        orders: list[OrderRow] = strawberry_django.field(
+            filters=OrderAliasFilter,
+        )
+
+    list_schema = strawberry.Schema(query=ListQuery)
+    for r in rows:
+        replayed = list_schema.execute_sync(
+            "query($f: OrderAliasFilter!) { orders(filters: $f) { id } }",
+            variable_values={"f": r["filter"]},
+        )
+        assert replayed.errors is None, (r["filter"], replayed.errors)
+        assert len(replayed.data["orders"]) == r["count"]
 
 
 # --------------------------------------------------------------------------

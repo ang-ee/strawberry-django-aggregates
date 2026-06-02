@@ -1665,12 +1665,10 @@ class AggregateBuilder:
                     f"granularity {grain.value!r}; cannot echo a filter "
                     "(SPEC § 4.4).",
                 )
+            # Pass the raw datetimes — ``_echo_field_filter`` does the
+            # lookup-type-aware value conversion (here: ISO-8601).
             return self._echo_field_filter(
-                fp,
-                {
-                    "gte": _json_filter_value(range_value.from_),
-                    "lt": _json_filter_value(range_value.to),
-                },
+                fp, {"gte": range_value.from_, "lt": range_value.to},
             )
 
         # Foreign-key axis: the group key is the related row's pk, and
@@ -1679,13 +1677,9 @@ class AggregateBuilder:
         # ``{field: {pk: <id>}}``; ``pk`` is validated against the live
         # relation filter exactly like any other lookup (DRY / fail-loud).
         if getattr(field, "many_to_one", False):
-            return self._echo_field_filter(
-                fp, {"pk": _json_filter_value(value)},
-            )
+            return self._echo_field_filter(fp, {"pk": value})
 
-        return self._echo_field_filter(
-            fp, {"exact": _json_filter_value(value)},
-        )
+        return self._echo_field_filter(fp, {"exact": value})
 
     def _echo_field_filter(
         self,
@@ -1694,13 +1688,20 @@ class AggregateBuilder:
     ) -> dict[str, Any]:
         """Return ``{camelField: {camelLookup: value}}`` for one axis.
 
-        DRY: the field and every lookup name are resolved against the
-        live ``filter_type`` / its per-field lookup class. A missing
-        field or lookup is a fail-loud :class:`FilterEchoError` rather
-        than a silently-emitted JSON key — so a strawberry-django
-        filter-shape change surfaces as a testable error, not corrupt
-        output. Wire casing is delegated to strawberry's
-        :func:`to_camel_case`.
+        DRY: the field, every lookup name, AND the wire form of each
+        value are resolved against the live ``filter_type`` / its
+        per-field lookup class — nothing is hardcoded. A missing field or
+        lookup is a fail-loud :class:`FilterEchoError` rather than a
+        silently-emitted JSON key, so a strawberry-django filter-shape
+        change surfaces as a testable error, not corrupt output. Wire
+        casing is delegated to strawberry's :func:`to_camel_case`.
+
+        Value form follows the lookup's resolved type: when a lookup is
+        typed as a GraphQL enum (a ``choices`` column exposed as an enum
+        filter input), the value is the enum **wire name** (``DRAFT``) the
+        input accepts — NOT the stored value (``draft``) the group key
+        serializes to. A string lookup keeps the stored value. This is the
+        crux of round-tripping enum-typed choices columns (SPEC § 4.4).
         """
         from strawberry.utils.str_converters import to_camel_case
 
@@ -1734,12 +1735,15 @@ class AggregateBuilder:
                 "cannot be expressed against this filter type "
                 "(SPEC § 4.4).",
             )
-        return {
-            to_camel_case(field_path): {
-                to_camel_case(lookup_name): lookup_value
-                for lookup_name, lookup_value in lookup_values.items()
-            },
-        }
+        out: dict[str, Any] = {}
+        for lookup_name, raw_value in lookup_values.items():
+            enum_values = _lookup_enum_value_map(lookup_type, lookup_name)
+            if enum_values is not None:
+                wire = _enum_wire_name(raw_value, enum_values)
+            else:
+                wire = _json_filter_value(raw_value)
+            out[to_camel_case(lookup_name)] = wire
+        return {to_camel_case(field_path): out}
 
     @staticmethod
     def _populate_count_distinct_backing(
@@ -2001,6 +2005,71 @@ def _json_filter_value(value: Any) -> Any:
     if isinstance(value, str | int | float | bool) or value is None:
         return value
     return str(value)
+
+
+def _lookup_enum_value_map(
+    lookup_type: Any, lookup_name: str,
+) -> dict[Any, str] | None:
+    """Return ``{stored_value: wire_name}`` if ``lookup_name`` on
+    ``lookup_type`` is typed as a GraphQL enum, else ``None``.
+
+    A ``choices`` column may be exposed by the list filter either as a
+    plain string lookup (matches the stored value) or as an enum lookup
+    (matches the enum's wire NAME). The two require different echoed
+    values, so the echo must resolve the lookup's actual type rather than
+    assume. Strawberry stores an enum-typed field's resolved type as a
+    ``StrawberryEnumDefinition`` (carrying ``wrapped_cls`` and
+    ``values=[EnumValue(name, value), …]``) reachable via the type's
+    ``__strawberry_definition__``; a string lookup resolves to an
+    unresolved ``StrawberryTypeVar`` instead, which has no ``values`` and
+    so yields ``None`` (→ stored value is kept). Defensive: any failure
+    to resolve returns ``None`` and degrades to the stored-value path.
+    """
+    definition = getattr(lookup_type, "__strawberry_definition__", None)
+    if definition is None:
+        return None
+    for field in getattr(definition, "fields", ()) or ():
+        if getattr(field, "python_name", None) != lookup_name:
+            continue
+        resolved = getattr(field, "type", None)
+        # Unwrap StrawberryOptional / nested type wrappers to the leaf.
+        # The wrapper chain is finite and acyclic (typically depth 1 —
+        # StrawberryOptional over the leaf); the bound is paranoia
+        # against a pathological cycle, not an expected depth.
+        for _ in range(8):
+            inner = getattr(resolved, "of_type", None)
+            if inner is None:
+                break
+            resolved = inner
+        values = getattr(resolved, "values", None)
+        if values is not None and getattr(resolved, "wrapped_cls", None):
+            return {
+                ev.value: ev.name
+                for ev in values
+                if hasattr(ev, "value") and hasattr(ev, "name")
+            }
+        return None
+    return None
+
+
+def _enum_wire_name(value: Any, enum_values: dict[Any, str]) -> str:
+    """Map a bucket key ``value`` to the GraphQL enum **wire name** an
+    enum-typed lookup accepts (``draft`` → ``DRAFT``).
+
+    The bucket key is normally the aggregates-side enum member (its
+    ``.value`` is the stored value); a raw stored value is also handled
+    (Django ``.values()`` yields the raw scalar). The mapping is the
+    FILTER enum's ``{stored_value: wire_name}`` so the echoed name is the
+    one the list query's input actually accepts; falls back to the
+    member name / raw value if the stored value is not in the filter
+    enum (data outside the declared choices).
+    """
+    stored = value.value if isinstance(value, enum.Enum) else value
+    if stored in enum_values:
+        return enum_values[stored]
+    if isinstance(value, enum.Enum):
+        return value.name
+    return str(stored)
 
 
 def _selection_requests_filter(info: Any) -> bool:
