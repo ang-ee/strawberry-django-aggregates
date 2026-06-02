@@ -5,6 +5,39 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.4.0] — 2026-06-02
+
+### Added
+
+- **Grouped filter echo (opt-in).** A new `enable_filter_echo=True` flag on
+  `AggregateBuilder` adds a `filter: JSON!` field to each grouped bucket — a
+  value shaped exactly like the list query's `filter:` argument that
+  re-selects that bucket's rows, so a client can drill from a bucket into the
+  underlying list. Requires `filter_type`; applies to both the offset and
+  cursor grouped fields; computed lazily (only when `filter` is selected).
+  Default `False` keeps SDL byte-identical to a non-echo build (Critical
+  Rule 2). SPEC § 4.4.
+  - The bucket→filter translation reuses the live `filter_type` rather than
+    hardcoding names: filter field and lookup names (`exact`, `pk`, `gte`,
+    `lt`, `is_null`) are resolved against the type and **fail loud** when
+    absent, so a strawberry-django filter-shape change is a testable error,
+    not corrupt output. Wire casing is delegated to `to_camel_case`; the
+    half-open `{gte, lt}` interval is read from the already-computed
+    `BucketRange` (never strawberry-django's inclusive `range`).
+  - Value form mirrors what strawberry-django's default lookups expect: a
+    `choices` column echoes its **stored** value (`paid`), not the enum
+    member name the group key serializes to (`PAID`); a foreign-key axis
+    echoes `{ <fk>: { pk: <id> } }` (the relation-filter shape); dates use
+    ISO-8601; `Decimal` falls back to its string form. NULL keys echo
+    `{ isNull: true }`. Repeated axes on one field fold into a nested `AND`
+    so no clause is dropped.
+- **`FilterEchoError`** — new fail-loud error in the `AggregateError`
+  hierarchy, re-exported from the package root. Raised when a bucket cannot
+  be faithfully expressed as a list filter: NUMBER-granularity buckets
+  (disjoint ranges, no single interval), JSON-path group axes (no matching
+  GraphQL input field), or a `filter_type` missing the required field /
+  lookup.
+
 ## [0.3.0] — 2026-05-31
 
 ### Added

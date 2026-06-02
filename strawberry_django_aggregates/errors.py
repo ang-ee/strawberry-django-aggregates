@@ -117,3 +117,29 @@ class ChoicesValueNotInEnumError(AggregateError):
     mid-serialization. Clean the data, re-add the value to ``choices``, or
     exclude the affected rows via the caller's queryset. See SPEC § 4.3.
     """
+
+
+class FilterEchoError(AggregateError):
+    """Raised when a grouped bucket cannot be echoed as a list filter.
+
+    The opt-in ``enable_filter_echo`` flag adds a ``filter: JSON!`` field to
+    each grouped bucket whose value re-selects that bucket's rows through
+    the existing list query's ``filter_type`` (SPEC § 4.4). The bucket key
+    cannot always be expressed as a faithful filter; we refuse loudly
+    rather than emit a wrong-but-plausible filter that would silently
+    select the wrong rows:
+
+    - a NUMBER-granularity bucket (``month_of_year`` etc.) selects disjoint
+      ranges across years and has no single-interval filter;
+    - a JSON-path group axis (``metadata.region``) has no matching GraphQL
+      input field on the list ``filter_type``;
+    - the ``filter_type`` has no field for the group axis, or that field's
+      lookup type does not expose the lookup the echo needs (``exact`` /
+      ``gte`` / ``lt`` / ``is_null``).
+
+    The last case is the load-bearing one: lookup names are resolved
+    against the live ``filter_type`` rather than hardcoded, so a
+    strawberry-django filter-shape change surfaces here as a testable error
+    instead of corrupt JSON. The message names the field, and the missing
+    lookup or the TIME-granularity alternative. See SPEC § 4.4.
+    """

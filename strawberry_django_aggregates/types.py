@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, NewType
 
 import strawberry
 import strawberry.federation
+from strawberry.scalars import JSON
 from strawberry_django.pagination import OffsetPaginationInfo
 
 from strawberry_django_aggregates.errors import (
@@ -1015,6 +1016,7 @@ def make_grouped_type(
     operators: dict[str, tuple[AggregateOp, ...]] | None = None,
     enable_federation: bool = False,
     json_paths: dict[str, str] | None = None,
+    enable_filter_echo: bool = False,
 ) -> tuple[type, type, type]:
     """Build ``<Model>GroupKey``, ``<Model>Grouped``, and
     ``<Model>GroupedResult`` types.
@@ -1028,6 +1030,15 @@ def make_grouped_type(
     fields on ``<Model>GroupKey`` (e.g. ``customer_id``) are marked
     ``@external`` since their canonical ownership lives in another
     subgraph — see SPEC § 18.
+
+    When ``enable_filter_echo=True`` the grouped bucket carries an extra
+    ``filter: JSON!`` field (emitted immediately after ``count``) holding a
+    drill-down filter the client can replay against the list query — see
+    SPEC § 4.4. The default leaves the field off so SDL is byte-identical
+    to a non-echo build (Critical Rule 2). The value is populated by the
+    resolver in :mod:`builder`; the default here is ``None`` (immutable, so
+    it is a legal ``make_dataclass`` default) and is never serialized
+    because the resolver always sets it when the field is selected.
     """
     name      = name or model.__name__
     overrides = dict(sorted((operators or {}).items()))
@@ -1053,6 +1064,14 @@ def make_grouped_type(
         ("key", group_key_cls, dataclasses.MISSING),
         ("count", int, 0),
     ]
+    # Per-bucket drill-down filter (SPEC § 4.4). Fixed position
+    # immediately after ``count`` so the SDL stays deterministic. Typed
+    # ``JSON`` (no ``| None``) → emitted as non-null ``filter: JSON!``;
+    # the ``None`` default is immutable (a dict default would be rejected
+    # by ``make_dataclass``) and never reaches the wire — the resolver
+    # always sets it. Off by default keeps SDL byte-identical (Rule 2).
+    if enable_filter_echo:
+        grouped_dc_fields.append(("filter", JSON, None))
     for op in _FIELD_OPERATORS:
         if op in nested_types:
             grouped_dc_fields.append(

@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-from collections.abc import Callable, Iterable
+import enum
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import TYPE_CHECKING, Any, Literal
@@ -39,6 +40,7 @@ from strawberry_django_aggregates.compiler import (
 )
 from strawberry_django_aggregates.errors import (
     ChoicesValueNotInEnumError,
+    FilterEchoError,
     OrderFieldNotAllowed,
 )
 from strawberry_django_aggregates.granularity import (
@@ -183,6 +185,15 @@ class AggregateBuilder:
         ``last`` / ``before``). ``"both"`` emits BOTH fields:
         ``<model>GroupBy`` (offset) plus ``<model>GroupByConnection``
         (cursor). See SPEC § 4 cursor pagination.
+    enable_filter_echo : when ``True``, each grouped bucket exposes an
+        extra ``filter: JSON!`` field — a value shaped like the list
+        query's ``filter:`` argument that re-selects that bucket's rows,
+        so a client can drill from a bucket into the underlying list.
+        Requires ``filter_type`` (raises :class:`FilterEchoError`
+        otherwise). Applies to both the offset and cursor grouped
+        fields, and is computed lazily (only when the client selects
+        ``filter``). Default ``False`` keeps SDL byte-identical to a
+        non-echo build. See SPEC § 4.4.
     """
 
     model:            type[Model]
@@ -204,10 +215,26 @@ class AggregateBuilder:
     # is exposed to every caller; row-level scoping is the queryset's
     # job per CLAUDE.md Critical Rule 1.
     json_paths:       dict[str, str] | None = None
+    # Per-bucket drill-down filter (SPEC § 4.4). When ``True``, each
+    # grouped bucket exposes ``filter: JSON!`` — a value shaped like the
+    # list query's ``filter:`` argument that re-selects that bucket's
+    # rows. Requires ``filter_type``. Default ``False`` → SDL is
+    # byte-identical to a non-echo build (Critical Rule 2).
+    enable_filter_echo: bool = False
 
     def build(self) -> BuiltAggregates:
         """Generate all types and return them along with attached fields."""
         name = self.name_prefix or self.model.__name__
+
+        # SPEC § 4.4: the echo needs a list filter input to mirror. Fail
+        # loud at build time rather than emit a ``filter: JSON!`` field
+        # that can never be populated.
+        if self.enable_filter_echo and self.filter_type is None:
+            raise FilterEchoError(
+                "enable_filter_echo=True requires AggregateBuilder."
+                "filter_type so the per-bucket filter can mirror the "
+                "list query's filter input (SPEC § 4.4).",
+            )
 
         aggregate_type = make_aggregate_type(
             self.model,
@@ -242,6 +269,7 @@ class AggregateBuilder:
                 operators=self.operators,
                 enable_federation=self.enable_federation,
                 json_paths=self.json_paths,
+                enable_filter_echo=self.enable_filter_echo,
             )
         )
         group_order_input = make_group_order_input(
@@ -462,11 +490,19 @@ class AggregateBuilder:
                     qs, spec, requested, having_dict, op_args=op_args,
                     week_start=ws,
                 )
+            # SPEC § 4.4: only build the per-bucket filter when the
+            # client actually selected ``results { filter }`` — the echo
+            # introspects the filter type and is wasted work otherwise.
+            want_filter = (
+                builder.enable_filter_echo
+                and _selection_requests_filter(info)
+            )
             grouped_rows = [
                 builder._shape_grouped(
                     grouped_type, group_key_type, row, requested, spec,
                     op_args=op_args,
                     week_start=ws,
+                    echo_filter=want_filter,
                 )
                 for row in rows
             ]
@@ -641,6 +677,13 @@ class AggregateBuilder:
                 op_args=op_args, week_start=ws,
             )
 
+            # SPEC § 4.4: per-bucket filter echo is symmetric across
+            # pagination styles. Build it only when ``filter`` is
+            # selected under ``edges { node { filter } }``.
+            want_filter = (
+                builder.enable_filter_echo
+                and _selection_requests_filter(info)
+            )
             edges: list[Any] = []
             for row in rows:
                 cursor_values = builder._cursor_values_for_row(
@@ -650,6 +693,7 @@ class AggregateBuilder:
                 node = builder._shape_grouped(
                     grouped_type, group_key_type, row, requested, spec,
                     op_args=op_args, week_start=ws,
+                    echo_filter=want_filter,
                 )
                 edges.append(grouped_edge_type(cursor=cursor, node=node))
 
@@ -1443,6 +1487,7 @@ class AggregateBuilder:
         spec: list[tuple[str, Any]],
         op_args: dict[str, dict[str, Any]] | None = None,
         week_start: int = 1,
+        echo_filter: bool = False,
     ) -> Any:
         key_kwargs: dict[str, Any] = {}
         for fp, grain in spec:
@@ -1518,6 +1563,20 @@ class AggregateBuilder:
             "key": key,
             "count": int(row.get("count", 0) or 0),
         }
+        # SPEC § 4.4: per-bucket drill-down filter. The ``filter`` field
+        # only exists on ``grouped_type`` when ``enable_filter_echo`` was
+        # set, so guard on the builder flag. ``echo_filter`` is the
+        # per-request "client actually selected ``filter``" signal — when
+        # it's False we still set the (non-null) field, to ``{}``, rather
+        # than do the filter-type introspection. ``key_kwargs`` already
+        # holds the per-axis values (enum-coerced) and the ``_range``
+        # ``BucketRange`` siblings, so the echo reuses them rather than
+        # recomputing aliases or ranges (DRY mandate).
+        if self.enable_filter_echo:
+            kwargs["filter"] = (
+                self._echo_bucket_filter(key_kwargs, spec)
+                if echo_filter else {}
+            )
         kwargs.update(
             self._build_nested_op_kwargs(
                 grouped_type, row, requested,
@@ -1532,6 +1591,155 @@ class AggregateBuilder:
         self._populate_count_distinct_backing(instance, row, requested)
         self._populate_percentile_backing(instance, row, requested, op_args)
         return instance
+
+    # ------- filter echo (SPEC § 4.4) -------------------------------------
+    #
+    # Translate one grouped bucket into a value shaped like the list
+    # query's ``filter:`` argument so a client can drill from the bucket
+    # into its underlying rows. DRY mandate: names are resolved from the
+    # live ``filter_type`` (never hardcoded) and a missing field / lookup
+    # is a fail-loud ``FilterEchoError``; the half-open interval is read
+    # from the ``BucketRange`` the key shaping already computed.
+
+    def _echo_bucket_filter(
+        self,
+        key_kwargs: dict[str, Any],
+        spec: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        """Return the list-filter value that re-selects one bucket.
+
+        Each group axis contributes one clause; clauses combine as
+        implicit AND across distinct filter fields (strawberry-django's
+        native semantics — see :func:`_and_filter_values`).
+        """
+        conditions = [
+            self._echo_axis_filter(fp, grain, key_kwargs)
+            for fp, grain in spec
+        ]
+        return _and_filter_values(conditions)
+
+    def _echo_axis_filter(
+        self,
+        fp: str,
+        grain: Any,
+        key_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return the filter clause for one group axis of a bucket."""
+        # JSON-path axes have no matching GraphQL input field on the list
+        # filter type (SPEC § 6.1 paths are dotted; filters are flat).
+        if self.json_paths and fp in self.json_paths:
+            raise FilterEchoError(
+                f"Cannot echo a list filter for JSON-path group axis "
+                f"{fp!r}: {self.model.__name__} list filter has no "
+                "matching GraphQL input field. Drop `filter` from the "
+                "selection or group by a model field instead "
+                "(SPEC § 4.4).",
+            )
+        field = self.model._meta.get_field(fp)
+        alias = group_by_alias(fp, grain, field)  # type: ignore[arg-type]
+        value = key_kwargs.get(alias)
+
+        # A NULL bucket key selects rows where the column IS NULL,
+        # regardless of granularity.
+        if value is None:
+            return self._echo_field_filter(fp, {"is_null": True})
+
+        if isinstance(grain, NumberGranularity):
+            raise FilterEchoError(
+                f"Cannot echo a row-selecting filter for NUMBER "
+                f"granularity {grain.value!r} on {fp!r}: a date-part "
+                "bucket selects disjoint ranges across years and has no "
+                "single-interval filter. Use a TIME granularity "
+                "(month, day, …) for a drill-down-able bucket "
+                "(SPEC § 4.4).",
+            )
+
+        if isinstance(grain, TimeGranularity):
+            # Reuse the half-open [from, to) interval the key shaping
+            # already computed — do NOT recompute it. Emit gte/lt, never
+            # strawberry-django's inclusive `range` lookup.
+            range_value = key_kwargs.get(f"{alias}_range")
+            if range_value is None:
+                raise FilterEchoError(
+                    f"Grouped bucket {fp!r} has no BucketRange for "
+                    f"granularity {grain.value!r}; cannot echo a filter "
+                    "(SPEC § 4.4).",
+                )
+            return self._echo_field_filter(
+                fp,
+                {
+                    "gte": _json_filter_value(range_value.from_),
+                    "lt": _json_filter_value(range_value.to),
+                },
+            )
+
+        # Foreign-key axis: the group key is the related row's pk, and
+        # strawberry-django models a relation filter as a nested input
+        # exposing ``pk`` (an ``ID`` scalar) — not ``exact``. Emit
+        # ``{field: {pk: <id>}}``; ``pk`` is validated against the live
+        # relation filter exactly like any other lookup (DRY / fail-loud).
+        if getattr(field, "many_to_one", False):
+            return self._echo_field_filter(
+                fp, {"pk": _json_filter_value(value)},
+            )
+
+        return self._echo_field_filter(
+            fp, {"exact": _json_filter_value(value)},
+        )
+
+    def _echo_field_filter(
+        self,
+        field_path: str,
+        lookup_values: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return ``{camelField: {camelLookup: value}}`` for one axis.
+
+        DRY: the field and every lookup name are resolved against the
+        live ``filter_type`` / its per-field lookup class. A missing
+        field or lookup is a fail-loud :class:`FilterEchoError` rather
+        than a silently-emitted JSON key — so a strawberry-django
+        filter-shape change surfaces as a testable error, not corrupt
+        output. Wire casing is delegated to strawberry's
+        :func:`to_camel_case`.
+        """
+        from strawberry.utils.str_converters import to_camel_case
+
+        assert self.filter_type is not None  # guarded in build()
+        filter_field = next(
+            (
+                f for f in dataclasses.fields(self.filter_type)
+                if f.name == field_path
+            ),
+            None,
+        )
+        if filter_field is None:
+            raise FilterEchoError(
+                f"Cannot echo a list filter for group axis "
+                f"{field_path!r}: {self.filter_type.__name__} has no "
+                f"{field_path!r} field. Add it to the list filter type "
+                "or drop `filter` from the selection (SPEC § 4.4).",
+            )
+        lookup_type = _unwrap_filter_optional(filter_field.type)
+        lookup_fields = (
+            {f.name for f in dataclasses.fields(lookup_type)}
+            if dataclasses.is_dataclass(lookup_type) else set()
+        )
+        missing = sorted(set(lookup_values) - lookup_fields)
+        if missing:
+            listed = ", ".join(missing)
+            raise FilterEchoError(
+                f"Cannot echo a list filter for group axis "
+                f"{field_path!r}: {self.filter_type.__name__}."
+                f"{field_path} lacks lookup(s): {listed}. The bucket "
+                "cannot be expressed against this filter type "
+                "(SPEC § 4.4).",
+            )
+        return {
+            to_camel_case(field_path): {
+                to_camel_case(lookup_name): lookup_value
+                for lookup_name, lookup_value in lookup_values.items()
+            },
+        }
 
     @staticmethod
     def _populate_count_distinct_backing(
@@ -1722,6 +1930,108 @@ def _unwrap_optional(annotation: Any) -> Any:
         if len(args) == 1:
             return args[0]
     return annotation
+
+
+# ---------------------------------------------------------------------------
+# Filter-echo helpers (SPEC § 4.4) — pure, module-level so the bucket→
+# filter translation stays testable without an AggregateBuilder instance.
+# ---------------------------------------------------------------------------
+
+def _unwrap_filter_optional(annotation: Any) -> Any:
+    """Resolve a strawberry-django filter field annotation to its lookup
+    type.
+
+    A filter field is typed ``<Lookup> | None``. Strawberry may store
+    this as a wrapper carrying ``.of_type`` (e.g. ``StrawberryOptional``)
+    or as a plain ``T | None`` union, depending on how the per-model
+    filter type was processed. Unwrap both forms so the caller can
+    introspect the lookup class's fields; return the annotation unchanged
+    when it is neither.
+    """
+    inner = getattr(annotation, "of_type", None)
+    if inner is not None:
+        return _unwrap_filter_optional(inner)
+    return _unwrap_optional(annotation)
+
+
+def _and_filter_values(values: list[dict[str, Any]]) -> dict[str, Any]:
+    """Combine per-axis filter clauses into one list-filter value.
+
+    Each clause is a single-field dict. Distinct fields combine as
+    implicit AND — strawberry-django AND-s multiple top-level keys. When
+    a field repeats (e.g. two granularities on one date axis, which both
+    constrain ``createdAt`` and so cannot share one lookup dict), the
+    extra clauses are folded into a nested ``AND`` (strawberry-django's
+    ``AND`` is a single nested filter, not a list — so the nesting is
+    recursive). No clause is ever dropped (Critical Rule 6); the echo
+    reuses strawberry-django's AND semantics rather than inventing a
+    combinator.
+    """
+    merged: dict[str, Any] = {}
+    seen: set[str] = set()
+    extra: list[dict[str, Any]] = []
+    for value in values:
+        if set(value) & seen:
+            extra.append(value)
+            continue
+        merged.update(value)
+        seen |= set(value)
+    if extra:
+        merged["AND"] = _and_filter_values(extra)
+    return merged
+
+
+def _json_filter_value(value: Any) -> Any:
+    """Return ``value`` in GraphQL-variable JSON form.
+
+    Enums serialize to their STORED ``.value`` — a choices-backed group
+    *key* serializes by member name (``PAID``), but strawberry-django's
+    default filter lookup for a ``choices`` column is a scalar that
+    matches the stored value (``paid``); echoing the name would produce a
+    filter that re-selects nothing. Dates/times use ISO-8601. JSON
+    scalars pass through; anything else (e.g. ``Decimal``) falls back to
+    ``str``, matching how those scalars serialize on the wire.
+    """
+    if isinstance(value, enum.Enum):
+        return _json_filter_value(value.value)
+    if isinstance(
+        value, datetime.datetime | datetime.date | datetime.time,
+    ):
+        return value.isoformat()
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    return str(value)
+
+
+def _selection_requests_filter(info: Any) -> bool:
+    """Return whether the grouped query selected a bucket ``filter`` field.
+
+    Recursively scans ``info.selected_fields`` for a selected field named
+    ``filter`` — present under ``results { filter }`` (offset) or
+    ``edges { node { filter } }`` (cursor). The top-level ``filter:`` is
+    an *argument*, never a selected field, and no aggregate/key field is
+    named ``filter``, so a selected field named ``filter`` anywhere in
+    the tree is unambiguously the bucket echo. Lets the resolver skip the
+    filter-type introspection entirely when the client didn't ask for it
+    (SPEC § 4.4). Recursing through ``selections`` also descends into
+    inline fragments / fragment spreads.
+    """
+    def walk(nodes: Any) -> bool:
+        for node in nodes or ():
+            # Only a real selected field (has ``alias``) named ``filter``
+            # counts — a fragment SPREAD whose fragment is named
+            # ``filter`` carries its name in ``.name`` but no ``.alias``,
+            # and must not trigger the echo. (Mirrors the SelectedField
+            # vs fragment discrimination in ``_flatten_selections``.)
+            if getattr(node, "name", None) == "filter" and hasattr(
+                node, "alias",
+            ):
+                return True
+            if walk(getattr(node, "selections", None)):
+                return True
+        return False
+
+    return walk(getattr(info, "selected_fields", None))
 
 
 def _keyset_filter(

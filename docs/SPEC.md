@@ -323,6 +323,50 @@ enum OrderStatus { DRAFT, PAID, CANCELLED }
 
 All three derive from `AggregateError` and are re-exported from the package root. The escape hatch for every collision/name case is the same: supply a django-choices-field `choices_enum` with explicit member names.
 
+### 4.4 · Grouped filter echo — per-bucket drill-down filter (opt-in)
+
+GraphQL forbids returning an `input` type from an output field, so a grouped bucket cannot return the `filter_type` instance that would re-select its rows. When `enable_filter_echo=True` is set on `AggregateBuilder`, each bucket instead exposes `filter: JSON!` — a plain JSON object shaped exactly like the value the existing list query's `filter:` argument accepts. A client drills from a bucket into the underlying rows by passing that object straight back as the list query's filter variable. Default is `False`; SDL is byte-identical to a non-echo build when off (Critical Rule 2 / determinism).
+
+Requires `filter_type` to be set and at least one group-by axis. Applies to BOTH the offset (`<model>GroupBy`) and cursor (`<model>GroupByConnection`) grouped fields when `pagination_style` emits them — the echo is symmetric across pagination styles.
+
+Emitted shape: `filter: JSON!` is added to `<Model>Grouped` immediately after `count`, before the per-operator nested-type fields (fixed position → deterministic SDL). It is computed lazily — only when the client actually selects `results { filter }` (offset) / `edges { node { filter } }` (cursor); otherwise it returns `{}` without touching the filter machinery.
+
+#### Bucket → filter mapping
+
+For each group-by axis the bucket key is translated to one filter clause:
+
+| Axis kind                              | Emitted clause                                                                                   |
+|----------------------------------------|--------------------------------------------------------------------------------------------------|
+| plain field, non-null key              | `{ <field>: { exact: <value> } }`                                                                |
+| foreign-key field, non-null key        | `{ <field>: { pk: <id> } }` — strawberry-django models a relation filter as a nested input exposing `pk` (an `ID` scalar), not `exact`. The id is the group key (`<field>_id`) |
+| any axis, null key                     | `{ <field>: { isNull: true } }`                                                                  |
+| TIME granularity (`month`, `day`…)     | `{ <field>: { gte: <from>, lt: <to> } }` from the bucket's half-open `BucketRange` (§7) — **never** strawberry-django's `range` lookup, which is inclusive |
+| NUMBER granularity (`month_of_year`…)  | **refuse** — `FilterEchoError`. A date-part bucket (e.g. "month = 5") selects disjoint ranges across years and has no single-interval filter; the message names the field and points at the TIME-granularity alternative |
+
+**Value form.** A clause value is the value strawberry-django's *default* filter lookup for that column expects — which is the model's **stored** value, serialized to its wire form: a `choices`-backed column echoes the stored value (`paid`), **not** the enum member name the group key serializes to (`PAID`), because strawberry-django generates a scalar string lookup for a plain `choices` column; dates/times use ISO-8601; `Decimal` and other non-JSON scalars fall back to their string form (matching how the scalar serializes). A consumer whose `filter_type` types a `choices` column as a GraphQL **enum input** instead is responsible for that mismatch — the echo cannot detect it (strawberry-django leaves the lookup value as an unresolved generic).
+
+Multiple axes combine as **implicit AND across distinct filter fields** (strawberry-django's native semantics). When a field repeats (e.g. two granularities on one date axis, which both constrain that field and so cannot share one lookup dict), the extra clauses fold into a nested `AND` — recursively, since strawberry-django's `AND` is a single nested filter, not a list. No clause is dropped (Rule 6); the echo does not invent a combinator.
+
+#### DRY mandate — reuse, never reinvent (load-bearing)
+
+The echo MUST NOT hardcode filter field names or lookup names:
+
+1. **Resolve names from the live types.** Field names come from `dataclasses.fields(filter_type)`; lookup names (`exact`, `is_null`, `gte`, `lt`) are validated against the resolved per-field lookup class. A required lookup that the field's lookup type does not expose is a **fail-loud** `FilterEchoError` naming the field and the missing lookup — not a silently-emitted JSON key. This makes a strawberry-django filter-shape change a testable error, not corrupt output.
+2. **Delegate wire casing** to strawberry's `to_camel_case` (so `is_null` → `isNull`, and `metadata__amount`-style names round-trip identically to the rest of the schema).
+3. **Reuse the library's own bucket machinery.** The half-open interval comes from the already-computed `BucketRange` / `bucket_range` (§7) and the key alias from `group_by_alias` — the echo reads them, it does not recompute ranges or aliases.
+
+#### Constraints
+
+- **JSON-path group axes refuse** (`metadata.region`): the list `filter_type` has no matching GraphQL input field, so an echo would be unfaithful. `FilterEchoError`, naming the path.
+- **Permission-naive** (Critical Rule 1): the echoed object is field/lookup values only — no identity, no actor. Row scoping remains the queryset's job.
+- **Layering** (Critical Rule 9): the mapping is GraphQL/strawberry-django-coupled (introspects input types, emits camelCase JSON), so it lives in the builder layer — never in `compiler.py`.
+
+All echo refusals raise `FilterEchoError` (a new `AggregateError` subclass, re-exported from the package root) so consumers can catch the family.
+
+#### Versioning
+
+New `AggregateBuilder` constructor param + additive SDL field ⇒ **minor** (Critical Rule 10).
+
 ## 5 · Aggregate operator vocabulary
 
 ```

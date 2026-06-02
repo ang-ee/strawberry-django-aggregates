@@ -8,8 +8,36 @@ Query field types eagerly from the live class objects.
 """
 
 import strawberry
+import strawberry_django
 
 from strawberry_django_aggregates import AggregateBuilder, AggregateOp
+
+
+def _build_echo_schema():
+    """Schema built with ``enable_filter_echo=True``. Returns
+    ``schema.as_str()`` for byte-comparison.
+    """
+    from tests.models import Order
+
+    @strawberry_django.filter_type(Order, lookups=True)
+    class OrderFilter:
+        status:     strawberry.auto
+        total:      strawberry.auto
+        created_at: strawberry.auto
+
+    built = AggregateBuilder(
+        model=Order,
+        aggregate_fields=["total", "quantity"],
+        group_by_fields=["customer", "status", "created_at"],
+        filter_type=OrderFilter,
+        enable_filter_echo=True,
+    ).build()
+
+    @strawberry.type
+    class Query:
+        orders_group_by: built.grouped_result_type = built.group_by_field
+
+    return strawberry.Schema(query=Query).as_str()
 
 
 def _build_schema(operators=None):
@@ -65,3 +93,23 @@ def test_schema_independent_of_operators_dict_order(db):
     assert sdl_a == sdl_b, (
         f"SDL depends on operators dict order:\n{_diff(sdl_a, sdl_b)}"
     )
+
+
+def test_filter_echo_off_omits_filter_field(db):
+    """Default (echo off) SDL carries no ``filter`` field on the grouped
+    bucket — byte-identical to a pre-echo build (Rule 2).
+    """
+    sdl = _build_schema()
+    assert "filter: JSON!" not in sdl
+
+
+def test_filter_echo_on_is_byte_identical_and_emits_field(db):
+    """Echo-on SDL is deterministic across builds and carries the
+    non-null ``filter: JSON!`` bucket field.
+    """
+    sdl_1 = _build_echo_schema()
+    sdl_2 = _build_echo_schema()
+    assert sdl_1 == sdl_2, (
+        f"echo SDL non-deterministic:\n{_diff(sdl_1, sdl_2)}"
+    )
+    assert "filter: JSON!" in sdl_1

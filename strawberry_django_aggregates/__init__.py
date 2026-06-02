@@ -56,6 +56,7 @@ from strawberry_django_aggregates.errors import (
     ChoicesEnumCollisionError,
     ChoicesEnumNameError,
     ChoicesValueNotInEnumError,
+    FilterEchoError,
     GranularityNotApplicable,
     GroupByFieldNotAllowed,
     HavingFieldNotAllowed,
@@ -97,7 +98,7 @@ from strawberry_django_aggregates.types import (
     make_having_input,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     # Builder (high-level)
@@ -146,6 +147,7 @@ __all__ = [
     "GroupByFieldNotAllowed",
     "GranularityNotApplicable",
     "JSONPathNotAllowed",
+    "FilterEchoError",
     "ChoicesEnumCollisionError",
     "ChoicesEnumNameError",
     "ChoicesValueNotInEnumError",
