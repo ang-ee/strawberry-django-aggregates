@@ -37,10 +37,12 @@ from strawberry_django_aggregates.compiler import (
     bucket_range,
     compute_aggregation,
     group_by_alias,
+    resolve_field_to_one_only,
 )
 from strawberry_django_aggregates.errors import (
     ChoicesValueNotInEnumError,
     FilterEchoError,
+    GroupByFieldNotAllowed,
     OrderFieldNotAllowed,
 )
 from strawberry_django_aggregates.granularity import (
@@ -824,6 +826,38 @@ class AggregateBuilder:
             deduped.append(entry)
         return deduped
 
+    def _group_axis_field_and_alias(
+        self,
+        fp: str,
+        grain: Any,
+    ) -> tuple[Any, str]:
+        """Resolve one group-by axis to its ``(leaf field, row alias)``.
+
+        JSON-path axes (SPEC § 6.1) have no Django field — they return
+        ``(None, alias)`` with the dotted path rewritten to the ``__``
+        column alias plus any granularity suffix. Model-field axes —
+        including forward to-one relation paths (SPEC § 6.2) — resolve
+        the leaf field via the shared
+        :func:`compiler.resolve_field_to_one_only` and derive the
+        canonical alias with :func:`compiler.group_by_alias`, identical
+        to the compiler, so the alias round-trips onto the ``.values()``
+        column. A to-many segment anywhere in the path fails loud with
+        ``AggregationAcrossRelationError`` (SPEC § 11). This is the
+        single resolver shared by the cursor key extraction and the
+        grouped-row shaping so both stay in lockstep with the compiler.
+        """
+        if self.json_paths and fp in self.json_paths:
+            base_alias = fp.replace(".", "__")
+            alias = (
+                f"{base_alias}_{grain.value}" if grain is not None
+                else base_alias
+            )
+            return None, alias
+        field = resolve_field_to_one_only(
+            self.model, fp, GroupByFieldNotAllowed,
+        )
+        return field, group_by_alias(fp, grain, field)
+
     def _cursor_values_for_row(
         self,
         row: dict[str, Any],
@@ -833,20 +867,9 @@ class AggregateBuilder:
         """Extract the canonical-order group-alias values from a row,
         in the same shape :func:`encode_group_cursor` expects.
         """
-        from strawberry_django_aggregates.compiler import (
-            group_by_alias as _gba,
-        )
         out: list[Any] = []
         for fp, grain in spec:
-            if self.json_paths and fp in self.json_paths:
-                base_alias = fp.replace(".", "__")
-                alias = (
-                    f"{base_alias}_{grain.value}" if grain is not None
-                    else base_alias
-                )
-            else:
-                field = self.model._meta.get_field(fp)
-                alias = _gba(fp, grain, field)  # type: ignore[arg-type]
+            _, alias = self._group_axis_field_and_alias(fp, grain)
             out.append(row.get(alias))
         return out
 
@@ -1491,23 +1514,15 @@ class AggregateBuilder:
     ) -> Any:
         key_kwargs: dict[str, Any] = {}
         for fp, grain in spec:
-            # JSON-path entries: alias derives from the dotted form
-            # (``metadata.region`` → ``metadata__region``) plus any
-            # granularity suffix. We do NOT call ``group_by_alias`` —
-            # that helper inspects the Django Field metadata to pick
-            # ``customer_id`` vs ``customer``, which has no parallel
-            # for synthetic JSON-path columns.
-            if self.json_paths and fp in self.json_paths:
-                base_alias = fp.replace(".", "__")
-                if grain is not None:
-                    alias = f"{base_alias}_{grain.value}"
-                else:
-                    alias = base_alias
-            else:
-                field = self.model._meta.get_field(fp)
-                alias = group_by_alias(
-                    fp, grain, field,  # type: ignore[arg-type]
-                )
+            # Resolve the axis to its leaf field + canonical row alias via
+            # the shared resolver. JSON-path axes (§ 6.1) yield
+            # ``(None, alias)`` from the dotted form
+            # (``metadata.region`` → ``metadata__region``); model-field
+            # axes — including forward to-one relation paths (§ 6.2) —
+            # yield the leaf field so the choices-enum coercion below can
+            # inspect it. The alias matches the compiler's ``.values()``
+            # column, so the row value round-trips onto the key.
+            field, alias = self._group_axis_field_and_alias(fp, grain)
             value = row.get(alias)
             # A ``choices``-backed group-by column is typed as a GraphQL
             # enum on ``<Model>GroupKey`` (see ``types._choices_enum_for``);
@@ -1524,8 +1539,12 @@ class AggregateBuilder:
                 and not getattr(field, "many_to_one", False)
             ):
                 key_name = self.name_prefix or self.model.__name__
+                # Pass the full axis path (``fp``) so the to-one
+                # ``shipment__status`` enum is keyed/named distinctly from
+                # a direct ``status`` axis — matches ``_emit_group_key``
+                # so the coerced value uses the SAME enum object.
                 choices_enum = _choices_enum_for(
-                    field, key_name,  # type: ignore[arg-type]
+                    field, key_name, fp,  # type: ignore[arg-type]
                 )
                 if choices_enum is not None:
                     try:
@@ -1634,6 +1653,21 @@ class AggregateBuilder:
                 "matching GraphQL input field. Drop `filter` from the "
                 "selection or group by a model field instead "
                 "(SPEC § 4.4).",
+            )
+        # Forward to-one relation axes (SPEC § 6.2, e.g. ``customer__active``)
+        # have no flat ``customerActive`` field on the list filter — the
+        # equivalent filter is nested (``{customer: {active: {...}}}``).
+        # Emitting a flat clause would be unfaithful, so refuse fail-loud
+        # rather than echo a filter the list query cannot honor. Mirrors
+        # the JSON-path refusal above (SPEC § 6.2 / § 4.4).
+        if "__" in fp:
+            raise FilterEchoError(
+                f"Cannot echo a list filter for to-one relation group "
+                f"axis {fp!r}: {self.model.__name__} list filter exposes "
+                "the related field as a nested input "
+                "(`{relation: {field: {...}}}`), not a flat clause. Drop "
+                "`filter` from the selection or group by a direct field "
+                "instead (SPEC § 6.2).",
             )
         field = self.model._meta.get_field(fp)
         alias = group_by_alias(fp, grain, field)  # type: ignore[arg-type]

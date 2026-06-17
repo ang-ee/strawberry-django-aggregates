@@ -1286,6 +1286,76 @@ def _is_relation_to_many(field: Field) -> bool:
                 or getattr(field, "many_to_many", False))
 
 
+def resolve_field_to_one_only(
+    model: Any,
+    field_path: str,
+    error_cls: type[Exception],
+) -> Field:
+    """Resolve a group-by field path, walking *to-one* relations only.
+
+    A single-segment name resolves via ``model._meta.get_field``. A
+    ``__``-traversing path walks each segment: every non-leaf segment
+    must be a forward to-one relation (FK / OneToOne) and resolves to
+    the leaf field. A to-many segment (reverse FK o2m, m2m) raises
+    :class:`AggregationAcrossRelationError` — grouping across it would
+    row-multiply the OUTER query (SPEC § 11). To-one traversal cannot
+    row-multiply (each parent row joins at most one related row), so it
+    is safe as a group-by axis (SPEC § 6.2).
+
+    The leaf field is returned unvalidated for the single-segment
+    to-many case (e.g. grouping directly by a reverse relation): the
+    caller still applies :func:`_is_relation_to_many` to the result.
+
+    Public (no leading underscore) because it is the shared group-by
+    path-resolution contract across three modules: this compiler
+    (``.values()`` aliasing), ``types.py`` (``<Model>GroupKey`` field
+    emission), and ``builder.py`` (grouped-row shaping + cursor key
+    extraction). All four must derive the same alias from the same walk;
+    the dependency direction is ``types``/``builder`` → ``compiler``,
+    which Critical Rule 9 permits.
+    """
+    if "__" not in field_path:
+        try:
+            return model._meta.get_field(field_path)
+        except Exception as exc:
+            raise error_cls(
+                f"Field `{field_path}` not found on `{model.__name__}`."
+            ) from exc
+    segments = field_path.split("__")
+    current_model: Any = model
+    for i, segment in enumerate(segments):
+        try:
+            f = current_model._meta.get_field(segment)
+        except Exception as exc:
+            raise error_cls(
+                f"Field `{segment}` (in path `{field_path}`) not found "
+                f"on `{current_model.__name__}`."
+            ) from exc
+        if i == len(segments) - 1:
+            return f
+        if _is_relation_to_many(f):
+            raise AggregationAcrossRelationError(
+                f"Cannot group by relation path `{field_path}` from "
+                f"`{model.__name__}` — segment `{segment}` is a to-many "
+                f"relation and would row-multiply. Group by the child "
+                f"model with the parent FK instead."
+            )
+        related = getattr(f, "related_model", None)
+        if related is None:
+            raise error_cls(
+                f"Segment `{segment}` in path `{field_path}` on "
+                f"`{current_model.__name__}` is not a relation; cannot "
+                f"traverse further."
+            )
+        current_model = related
+    # Defensive — unreachable: segments is non-empty and the leaf
+    # (last segment) returns inside the loop above.
+    raise error_cls(
+        f"Could not resolve group-by path `{field_path}` from "
+        f"`{model.__name__}`."
+    )
+
+
 def _resolve_traversal_chain(
     model: Any, field_path: str,
 ) -> tuple[list[Any], Any, str]:
@@ -1395,7 +1465,9 @@ def _build_group_by_annotations(
                 aliases.append(alias)
             continue
 
-        field = _resolve_field(model, field_path, GroupByFieldNotAllowed)
+        field = resolve_field_to_one_only(
+            model, field_path, GroupByFieldNotAllowed,
+        )
         if _is_relation_to_many(field):
             raise AggregationAcrossRelationError(
                 f"Cannot group by relation `{field_path}` from "

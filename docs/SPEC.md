@@ -768,6 +768,105 @@ to every caller; row-level scoping is the queryset's responsibility per
 CLAUDE.md Critical Rule 1. We do NOT add a `user`-aware filter on
 JSON-path values; the queryset is trusted.
 
+### 6.2 · Forward to-one relation group-by axes
+
+A `group_by` axis may walk a **to-one** relation to a scalar leaf on the
+related model — a forward `ForeignKey` / `OneToOneField`, or a reverse
+`OneToOneField` accessor. The defining property is "resolves to **at most one**
+related row per parent" (the walk rejects any segment for which
+`_is_relation_to_many` is true — reverse FK one-to-many and many-to-many);
+both directions of a one-to-one qualify. The axis is addressed with Django's
+own `__` separator:
+
+```graphql
+ordersGroupBy(groupBy: [{ field: CUSTOMER__ACTIVE }])
+```
+
+```python
+AggregateBuilder(
+    model=Order,
+    aggregate_fields=["total"],
+    group_by_fields=["customer__active"],  # Order → customer (FK) → active
+)
+```
+
+**Why this is safe — and why o2m / m2m are not.** A forward to-one join
+matches **at most one** related row per parent row, so grouping across it
+cannot row-multiply: the outer row count is unchanged and every measure
+in the query stays correct. This is categorically different from the
+one-to-many / many-to-many traversal that § 11 refuses, where the implicit
+JOIN fans each parent out into N rows and silently corrupts every measure.
+A to-many segment anywhere in a group-by path therefore remains **refused**
+with `AggregationAcrossRelationError` (see § 11) — the to-one allowance does
+not weaken Critical Rule 4; it carves out the one join shape that provably
+cannot multiply.
+
+**Multi-hop.** Every non-leaf segment must be a forward to-one relation;
+the chain may be arbitrarily long (`order__customer__region__name`). The
+first to-many segment encountered raises — the path is validated segment by
+segment, left to right.
+
+**Alias / key surfacing.** The group key field on `<Model>GroupKey` is named
+with the **full `__` path**, matching the compiler's `.values()` alias so the
+row dict round-trips onto the key. Leaf-type rules are identical to a
+single-segment axis (§ 4):
+
+| Leaf field kind          | Key field name              | Wire type                          |
+|--------------------------|-----------------------------|------------------------------------|
+| plain scalar             | `customer__active`          | the leaf's natural scalar          |
+| `choices` column         | `order__status`             | the leaf's group-by enum (§ 4.3)   |
+| foreign key (FK leaf)    | `order__customer_id`        | the related pk scalar (`_id` suffix)|
+| `date` / `datetime`      | `customer__created_at`      | granularity buckets apply (§ 7)    |
+
+Strawberry camel-cases the `__` Python identifier to a wire name with an
+embedded capital (`customer__active` → `customer_Active`); the groupable-field
+enum member is the upper-cased path (`CUSTOMER__ACTIVE`). Both are stable
+across builds (Critical Rule 2).
+
+**`_id` suffix is FK-only.** The `_id` surfacing applies to a `many_to_one`
+(FK) leaf. A forward `OneToOneField` leaf is `many_to_one = False`, so it
+surfaces under the **bare path** (no `_id`), keyed off the related row — the
+type emitter and the resolver share `group_by_alias`, so they stay mutually
+consistent either way.
+
+**Choices-leaf enum naming is keyed on the full axis path, not the leaf
+name.** A `choices` leaf reached through a to-one hop emits its group-by enum
+(§ 4.3) named `f"{prefix}{PascalCase(axis_path)}"` — `OrderShipmentStatus`
+for `shipment__status`, distinct from a direct `status` axis's `OrderStatus`.
+This is load-bearing: two axes can share a leaf field name (a direct `status`
+and a related `shipment__status` whose target model *also* has a `status`
+column with a **different** choice set), and naming/caching the enum on the
+leaf `field.name` alone would silently reuse the first-built enum's vocabulary
+for the second axis. For a single-segment axis the path *is* the field name,
+so the emitted type name is byte-identical to a pre-§-6.2 build (Rule 2).
+
+**Measures unaffected.** This subsection is about **group-by axes** only.
+Measures still never auto-traverse a relation; § 11's refusal and the
+primitive-only `allow_relation_traversal=True` opt-in are unchanged.
+
+**Filter echo (§ 4.4) refuses to-one axes.** A to-one group axis has no flat
+`customerActive` field on the list `filter_type` — the equivalent filter is
+*nested* (`{ customer: { active: { exact: … } } }`). Rather than emit an
+unfaithful clause, `enable_filter_echo=True` **refuses** a to-one axis with a
+fail-loud `FilterEchoError` naming the path (mirrors the JSON-path refusal).
+Nested filter-echo may be specced later; until then refusing is the
+Rule-6-correct stance.
+
+**SQLite.** Unlike the date-bucketing and JSON-cast paths, to-one traversal
+is a plain SQL JOIN with no vendor-specific function — it works identically on
+PostgreSQL and SQLite. No degradation note needed.
+
+**Resolution helper.** `compiler.resolve_field_to_one_only(model, path,
+error_cls)` is the single source of truth for walking a to-one path to its
+leaf field and refusing to-many segments. It is consumed by the compiler
+(`.values()` aliasing), the type emitter (`<Model>GroupKey`), and the builder
+(grouped-row shaping, cursor key extraction) so all four derive the same alias
+from the same walk. Direction is `types.py` / `builder.py` → `compiler.py`
+(allowed; Critical Rule 9 only forbids the reverse).
+
+**Versioning.** New groupable-field enum members + new `<Model>GroupKey`
+fields are **additive** ⇒ **minor** (Critical Rule 10).
+
 ## 7 · Date granularity — TIME and NUMBER tracks
 
 Two parallel tracks, mirroring Odoo's `READ_GROUP_TIME_GRANULARITY` and `READ_GROUP_NUMBER_GRANULARITY` (`odoo/models.py:217`):
@@ -1181,7 +1280,7 @@ FROM (
 The flag is intentionally narrow in v1.0:
 
 - **Supported operators**: `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`, `COUNT_DISTINCT` only. Other operators (`STDDEV`, `VARIANCE`, `STDDEV_POP`, `VAR_POP`, `PERCENTILE_CONT`, `PERCENTILE_DISC`, `MODE`, `ARRAY_AGG`, `STRING_AGG`, `BOOL_AND`, `BOOL_OR`, `COUNT_DISTINCT_TUPLE`) raise `AggregateError` with a clear v1.0-limitation message rather than emitting incorrect SQL. The unsupported-op check runs BEFORE the Postgres-only vendor check, so the v1.0 message wins on every vendor.
-- **Measures only**: `group_by` paths still cannot traverse one-to-many or many-to-many relations even with the flag set. Group-by traversal would row-multiply the OUTER query and corrupt every measure regardless of any subquery isolation downstream.
+- **Measures only**: `group_by` paths still cannot traverse one-to-many or many-to-many relations even with the flag set. Group-by traversal of a to-many relation would row-multiply the OUTER query and corrupt every measure regardless of any subquery isolation downstream. (Forward *to-one* group-by axes — which cannot row-multiply — are allowed and need no flag; see § 6.2.)
 - **Empty children**: a parent row with zero matching children produces a `NULL` in the per-row Subquery (the inner `GROUP BY` yields no rows). The outer `SUM` ignores `NULL` inputs by default — for `COUNT` / `COUNT_DISTINCT` this surfaces as `None` in result rows when the parent group has zero children. Callers who need a `0` surface should `COALESCE` post-fetch.
 
 #### Where the flag lives

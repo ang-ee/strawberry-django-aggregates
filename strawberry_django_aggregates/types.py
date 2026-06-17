@@ -38,9 +38,11 @@ import strawberry.federation
 from strawberry.scalars import JSON
 from strawberry_django.pagination import OffsetPaginationInfo
 
+from strawberry_django_aggregates.compiler import resolve_field_to_one_only
 from strawberry_django_aggregates.errors import (
     ChoicesEnumCollisionError,
     ChoicesEnumNameError,
+    GroupByFieldNotAllowed,
 )
 from strawberry_django_aggregates.granularity import (
     NumberGranularity,
@@ -357,7 +359,7 @@ def _sanitize_member_name(raw: str) -> str:
 
 
 def _choices_enum_for(
-    field: Field, prefix: str,
+    field: Field, prefix: str, axis_path: str | None = None,
 ) -> type[enum.Enum] | None:
     """Build (and cache) a Strawberry enum for a choices group-by field.
 
@@ -378,8 +380,19 @@ def _choices_enum_for(
     :class:`ChoicesEnumCollisionError` (fail-loud) — we never silently
     deduplicate.
 
-    The emitted GraphQL type is named ``f"{prefix}{PascalCase(field.name)}"``
-    (e.g. ``OrderStatus``) and cached per ``(prefix, field.name)``.
+    ``axis_path`` is the full group-by axis path (``"status"`` for a
+    direct field, ``"shipment__status"`` for a forward to-one relation
+    axis — SPEC § 6.2). The emitted GraphQL type is named and cached on
+    that path, NOT the leaf ``field.name``: two axes can share a leaf
+    name (a direct ``status`` and a related ``shipment__status`` whose
+    target model also has a ``status`` column with a *different* choice
+    set), and keying on ``field.name`` alone would let the first-built
+    enum be reused for the second axis — silently emitting the wrong
+    vocabulary. The type is ``f"{prefix}{PascalCase(axis_path)}"``
+    (``OrderStatus`` / ``OrderShipmentStatus``) and cached per
+    ``(prefix, axis_path)``. For a single-segment axis ``axis_path ==
+    field.name``, so this is byte-identical to pre-§-6.2 output. When
+    ``axis_path`` is omitted it defaults to ``field.name``.
 
     Reads ``field.choices_enum`` via ``getattr`` only — the library has
     no dependency on django-choices-field.
@@ -389,12 +402,13 @@ def _choices_enum_for(
     if not field.choices:
         return None
 
-    cache_key = (prefix, field.name)
+    path = axis_path if axis_path is not None else field.name
+    cache_key = (prefix, path)
     cached = _CHOICES_ENUM_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    type_name = f"{prefix}{_pascal_case(field.name)}"
+    type_name = f"{prefix}{_pascal_case(path)}"
 
     choices_enum = getattr(field, "choices_enum", None)
     members: list[tuple[str, Any]]
@@ -1162,7 +1176,14 @@ def _emit_group_key(
                     ))
             continue
 
-        field = model._meta.get_field(field_name)
+        # A ``__``-path group-by axis traverses forward to-one relations
+        # (FK / OneToOne) to a leaf scalar on the related model; the key
+        # field is named with the full path (e.g. ``customer__active``)
+        # to match the compiler's ``.values()`` alias. To-many segments
+        # are refused (SPEC § 11) by the shared resolver.
+        field = resolve_field_to_one_only(
+            model, field_name, GroupByFieldNotAllowed,
+        )
         # FK fields surface as `<name>_id` per SPEC § 4.
         if getattr(field, "many_to_one", False):
             py_type = _natural_python_type(field)  # type: ignore[arg-type]
@@ -1175,7 +1196,9 @@ def _emit_group_key(
             # ``_choices_enum_for`` returns ``None`` for date/datetime
             # and non-choices fields, in which case we keep the natural
             # scalar from ``_natural_python_type``.
-            choices_enum = _choices_enum_for(field, name)  # type: ignore[arg-type]
+            choices_enum = _choices_enum_for(
+                field, name, field_name,  # type: ignore[arg-type]
+            )
             py_type = (
                 choices_enum
                 if choices_enum is not None

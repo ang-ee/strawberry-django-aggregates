@@ -5,6 +5,38 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.5.0] — 2026-06-17
+
+### Added
+
+- **Forward to-one relation group-by axes.** A `group_by` axis may now walk a
+  forward to-one relation (`ForeignKey` / `OneToOneField`) to a scalar leaf on
+  the related model, addressed with Django's `__` separator (e.g.
+  `customer__active` on `Order`, or multi-hop `order__customer__active`). A
+  to-one join matches at most one related row per parent, so it cannot
+  row-multiply — unlike the one-to-many / many-to-many traversal that remains
+  refused with `AggregationAcrossRelationError` (Critical Rule 4 unchanged).
+  The group key field is named with the full `__` path; an FK leaf surfaces as
+  `<path>_id`, a `choices` leaf keeps its group-by enum, a `date` / `datetime`
+  leaf accepts granularity buckets. Works identically on PostgreSQL and SQLite
+  (plain JOIN, no vendor-specific function). SPEC § 6.2.
+  - Applies to the backend primitive (`compute_aggregation`),
+    `AggregateBuilder`, and the GraphQL groupable-field enum; offset and cursor
+    pagination both shape the bucket key correctly.
+  - Filter echo (`enable_filter_echo=True`) **refuses** a to-one axis with a
+    fail-loud `FilterEchoError` — the related field is nested on the list
+    filter (`{customer: {active: …}}`), not flat, so an echoed flat clause
+    would be unfaithful. SPEC § 6.2 / § 4.4.
+  - Path resolution is centralized in the new public
+    `compiler.resolve_field_to_one_only`, shared by the compiler, the type
+    emitter, and the builder so all derive the same `.values()` alias from the
+    same to-one walk; a to-many segment anywhere in the path fails loud.
+
+### Notes
+
+- Additive only — new groupable-field enum members and new `<Model>GroupKey`
+  fields. SDL for existing inputs is byte-identical (Critical Rule 2 / 10).
+
 ## [0.4.1] — 2026-06-02
 
 ### Fixed
