@@ -31,6 +31,7 @@ from strawberry_django.pagination import (
     OffsetPaginationInfo,
     OffsetPaginationInput,
 )
+from strawberry_django.settings import strawberry_django_settings
 
 from strawberry_django_aggregates.compiler import (
     HAVING_COMPARISONS,
@@ -196,6 +197,18 @@ class AggregateBuilder:
         fields, and is computed lazily (only when the client selects
         ``filter``). Default ``False`` keeps SDL byte-identical to a
         non-echo build. See SPEC § 4.4.
+    filter_echo_relation_identity : optional callable ``(field, value)
+        -> lookup_values`` for foreign-key group axes. ``value`` is the
+        grouped related database pk. By default the builder echoes that
+        raw value under strawberry-django's configured
+        ``DEFAULT_PK_FIELD_NAME``. That default is correct only when the
+        configured lookup accepts a raw pk (``pk``, ``id``); if
+        ``DEFAULT_PK_FIELD_NAME`` names an opaque scheme (``sqid``, …) the
+        hook is **required** — return e.g.
+        ``{"sqid": encode(field.remote_field.model, value)}``. Requires
+        ``enable_filter_echo=True`` (else a build-time ``FilterEchoError``);
+        the returned mapping is validated against the live relation filter
+        exactly like every other echo lookup (SPEC § 4.4).
     """
 
     model:            type[Model]
@@ -223,6 +236,10 @@ class AggregateBuilder:
     # rows. Requires ``filter_type``. Default ``False`` → SDL is
     # byte-identical to a non-echo build (Critical Rule 2).
     enable_filter_echo: bool = False
+    filter_echo_relation_identity: Callable[
+        [Any, Any],
+        Mapping[str, Any],
+    ] | None = None
 
     def build(self) -> BuiltAggregates:
         """Generate all types and return them along with attached fields."""
@@ -236,6 +253,20 @@ class AggregateBuilder:
                 "enable_filter_echo=True requires AggregateBuilder."
                 "filter_type so the per-bucket filter can mirror the "
                 "list query's filter input (SPEC § 4.4).",
+            )
+
+        # A relation-identity hook is meaningless unless the echo runs.
+        # Fail loud rather than silently ignore it — a configured hook
+        # that never fires is a latent correctness bug for opaque-id
+        # projects (SPEC § 4.4).
+        if (
+            self.filter_echo_relation_identity is not None
+            and not self.enable_filter_echo
+        ):
+            raise FilterEchoError(
+                "filter_echo_relation_identity requires "
+                "enable_filter_echo=True; the hook only runs while "
+                "echoing a per-bucket filter (SPEC § 4.4).",
             )
 
         aggregate_type = make_aggregate_type(
@@ -1705,13 +1736,34 @@ class AggregateBuilder:
                 fp, {"gte": range_value.from_, "lt": range_value.to},
             )
 
-        # Foreign-key axis: the group key is the related row's pk, and
-        # strawberry-django models a relation filter as a nested input
-        # exposing ``pk`` (an ``ID`` scalar) — not ``exact``. Emit
-        # ``{field: {pk: <id>}}``; ``pk`` is validated against the live
-        # relation filter exactly like any other lookup (DRY / fail-loud).
+        # Foreign-key axis: the group key is the related row's database
+        # pk, but strawberry-django owns the public relation-filter lookup
+        # name. Its default is ``pk``; projects may configure it to
+        # ``id``, ``sqid``, etc. Use that owner instead of hardcoding the
+        # lookup here, then validate it against the live filter type just
+        # like any other lookup (DRY / fail-loud).
         if getattr(field, "many_to_one", False):
-            return self._echo_field_filter(fp, {"pk": value})
+            if self.filter_echo_relation_identity is not None:
+                lookup_values = self.filter_echo_relation_identity(
+                    field, value,
+                )
+                # Fail loud with a typed error naming the hook, rather
+                # than let a non-mapping return surface as a cryptic
+                # AttributeError deep inside ``_echo_field_filter``.
+                if not isinstance(lookup_values, Mapping):
+                    raise FilterEchoError(
+                        "filter_echo_relation_identity must return a "
+                        "mapping of {lookup_name: value} for group axis "
+                        f"{fp!r}; got "
+                        f"{type(lookup_values).__name__} (SPEC § 4.4).",
+                    )
+            else:
+                lookup_values = {
+                    strawberry_django_settings()[
+                        "DEFAULT_PK_FIELD_NAME"
+                    ]: value,
+                }
+            return self._echo_field_filter(fp, lookup_values)
 
         return self._echo_field_filter(fp, {"exact": value})
 

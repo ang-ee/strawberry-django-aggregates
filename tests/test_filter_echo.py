@@ -16,6 +16,7 @@ import pytest
 import strawberry
 import strawberry_django
 from django.db import models
+from django.test import override_settings
 from strawberry_django.fields.filter_types import FilterLookup
 
 from strawberry_django_aggregates import AggregateBuilder, FilterEchoError
@@ -41,6 +42,18 @@ class OrderFilterNoCustomer:
     """
     status:     strawberry.auto
     created_at: strawberry.auto
+
+
+@strawberry.input
+class CustomerSqidLookup:
+    """Explicit relation filter shape used to prove custom public ids."""
+
+    sqid: strawberry.ID
+
+
+@strawberry_django.filter_type(Order, lookups=True)
+class OrderFilterCustomerSqid:
+    customer: CustomerSqidLookup | None
 
 
 @strawberry.enum
@@ -97,7 +110,11 @@ def _list_schema():
     return strawberry.Schema(query=Query)
 
 
-def _build(pagination_style="offset", filter_type=OrderFilter):
+def _build(
+    pagination_style="offset",
+    filter_type=OrderFilter,
+    **builder_kwargs,
+):
     built = AggregateBuilder(
         model=Order,
         aggregate_fields=["total", "quantity"],
@@ -108,6 +125,7 @@ def _build(pagination_style="offset", filter_type=OrderFilter):
         filter_type=filter_type,
         enable_filter_echo=True,
         pagination_style=pagination_style,
+        **builder_kwargs,
     ).build()
     return built
 
@@ -260,9 +278,15 @@ def test_multi_axis_implicit_and(echo_schema, echo_orders):
     assert set(bucket["filter"]["createdAt"]) == {"gte", "lt"}
 
 
-def test_foreign_key_axis_echoes_pk(echo_schema, echo_orders):
-    """An FK axis echoes ``{field: {pk: <id>}}`` — strawberry-django's
-    relation-filter shape — not ``{exact}``.
+def test_foreign_key_axis_echoes_default_public_pk_lookup(
+    echo_schema,
+    echo_orders,
+):
+    """An FK axis uses strawberry-django's default relation identity lookup.
+
+    The default lookup is ``pk`` — not ``exact`` — and remains backward
+    compatible for projects that do not customize strawberry-django's
+    ``DEFAULT_PK_FIELD_NAME``.
     """
     result = echo_schema.execute_sync("""
         query {
@@ -282,6 +306,82 @@ def test_foreign_key_axis_echoes_pk(echo_schema, echo_orders):
     assert str(bucket["filter"]["customer"]["pk"]) == str(
         bucket["key"]["customerId"],
     )
+
+
+def test_foreign_key_axis_echoes_configured_public_pk_lookup(echo_orders):
+    """An FK axis follows strawberry-django's configured public pk name.
+
+    The filter type is the hand-written ``OrderFilterCustomerSqid`` rather
+    than ``customer: strawberry.auto`` on purpose: strawberry-django caches
+    the *auto-generated* relation-filter input in a process-global
+    (``_DjangoModelFilterInput``) computed on first use and never recomputed,
+    so ``override_settings`` cannot retro-rename an already-cached auto input
+    within one test run. The explicit filter type isolates what this test
+    asserts — that the builder reads ``DEFAULT_PK_FIELD_NAME`` for the echo
+    lookup name. Do not "simplify" it back to ``strawberry.auto``.
+    """
+    with override_settings(
+        STRAWBERRY_DJANGO={"DEFAULT_PK_FIELD_NAME": "sqid"},
+    ):
+        built = _build(filter_type=OrderFilterCustomerSqid)
+
+        @strawberry.type
+        class Query:
+            orders_group_by: built.grouped_result_type = built.group_by_field
+
+        schema = strawberry.Schema(query=Query)
+        result = schema.execute_sync("""
+            query {
+                ordersGroupBy(groupBy: [{ field: CUSTOMER }]) {
+                    results { key { customerId } filter }
+                }
+            }
+        """)
+
+    assert result.errors is None, result.errors
+    bucket = result.data["ordersGroupBy"]["results"][0]
+    assert set(bucket["filter"]) == {"customer"}
+    assert set(bucket["filter"]["customer"]) == {"sqid"}
+    assert str(bucket["filter"]["customer"]["sqid"]) == str(
+        bucket["key"]["customerId"],
+    )
+
+
+def test_foreign_key_axis_echo_identity_hook_converts_value(echo_orders):
+    """A project can convert the grouped raw pk into an opaque public id.
+
+    The hook drives both the lookup name and the value form on its own,
+    so this needs no ``DEFAULT_PK_FIELD_NAME`` override — proving the hook
+    is the single source of truth on the relation-identity path.
+    """
+
+    def relation_identity(field, value):
+        assert field.name == "customer"
+        return {"sqid": f"cus_{value}"}
+
+    built = _build(
+        filter_type=OrderFilterCustomerSqid,
+        filter_echo_relation_identity=relation_identity,
+    )
+
+    @strawberry.type
+    class Query:
+        orders_group_by: built.grouped_result_type = built.group_by_field
+
+    schema = strawberry.Schema(query=Query)
+    result = schema.execute_sync("""
+        query {
+            ordersGroupBy(groupBy: [{ field: CUSTOMER }]) {
+                results { key { customerId } filter }
+            }
+        }
+    """)
+
+    assert result.errors is None, result.errors
+    bucket = result.data["ordersGroupBy"]["results"][0]
+    assert bucket["filter"]["customer"] == {
+        "sqid": f"cus_{bucket['key']['customerId']}",
+    }
 
 
 def test_repeated_axis_nests_and_without_dropping(echo_schema, echo_orders):
@@ -563,6 +663,55 @@ def test_enable_filter_echo_without_filter_type_raises():
             group_by_fields=["status"],
             enable_filter_echo=True,
         ).build()
+
+
+def test_relation_identity_hook_without_echo_raises():
+    """A relation-identity hook with the echo disabled is a misconfig:
+    the hook would silently never fire. Fail loud at build time.
+    """
+    with pytest.raises(
+        FilterEchoError, match="filter_echo_relation_identity",
+    ):
+        AggregateBuilder(
+            model=Order,
+            aggregate_fields=["total"],
+            group_by_fields=["customer"],
+            filter_type=OrderFilter,
+            enable_filter_echo=False,
+            filter_echo_relation_identity=lambda field, value: {"pk": value},
+        ).build()
+
+
+def test_relation_identity_hook_bogus_lookup_refused_unit():
+    """The hook's returned mapping is validated against the live relation
+    filter exactly like every other echo lookup — a lookup the filter does
+    not expose fails loud, so the hook cannot inject an unvalidated JSON
+    key (Critical Rule 6).
+    """
+    builder = AggregateBuilder(
+        model=Order,
+        group_by_fields=["customer"],
+        filter_type=OrderFilter,
+        enable_filter_echo=True,
+        filter_echo_relation_identity=lambda field, value: {"bogus": value},
+    )
+    with pytest.raises(FilterEchoError, match="bogus"):
+        builder._echo_axis_filter("customer", None, {"customer_id": 1})
+
+
+def test_relation_identity_hook_non_mapping_refused_unit():
+    """A hook that returns a non-mapping fails loud with a typed error
+    naming the hook, not a cryptic AttributeError deep in the echo path.
+    """
+    builder = AggregateBuilder(
+        model=Order,
+        group_by_fields=["customer"],
+        filter_type=OrderFilter,
+        enable_filter_echo=True,
+        filter_echo_relation_identity=lambda field, value: [value],
+    )
+    with pytest.raises(FilterEchoError, match="must return a mapping"):
+        builder._echo_axis_filter("customer", None, {"customer_id": 1})
 
 
 # --------------------------------------------------------------------------

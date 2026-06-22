@@ -5,6 +5,34 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.6.0] — 2026-06-22
+
+### Added
+
+- **Configurable foreign-key filter-echo identity.** The grouped filter echo
+  (`enable_filter_echo=True`) no longer hardcodes `{ <fk>: { pk: <id> } }`. The
+  relation-filter lookup name now tracks strawberry-django's configured
+  `DEFAULT_PK_FIELD_NAME` (still `pk` by default, so existing schemas are
+  unchanged), fixing a latent mismatch for projects that renamed it. SPEC § 4.4.
+- **`filter_echo_relation_identity` hook on `AggregateBuilder`.** An optional
+  callable `(field, value) -> lookup_values` for foreign-key group axes, letting
+  a host framework echo opaque public ids (e.g. `{ customer: { sqid: "cus_…" } }`)
+  instead of the raw database pk. The returned mapping is validated against the
+  live relation filter exactly like every other echo lookup — an unknown lookup
+  name is a fail-loud `FilterEchoError` (Critical Rule 6). The hook receives the
+  Django relation field and the grouped database pk only — no actor, queryset, or
+  identity concept — so the core stays permission- and identity-scheme-neutral
+  (Critical Rule 1). It is **required** when `DEFAULT_PK_FIELD_NAME` names an
+  opaque scheme, since the library cannot tell a renamed-but-raw lookup from an
+  encoded one. Setting it without `enable_filter_echo=True` is a build-time
+  `FilterEchoError`.
+
+### Notes
+
+- Additive only — a new optional `AggregateBuilder` field defaulting to `None`.
+  SDL is byte-identical to 0.5.0 (Critical Rules 2 / 10); the hook only shapes
+  the lazily-computed `filter: JSON!` runtime value.
+
 ## [0.5.0] — 2026-06-17
 
 ### Added
