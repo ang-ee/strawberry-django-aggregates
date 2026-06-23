@@ -5,6 +5,14 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.6.1] — 2026-06-23
+
+### Changed
+
+- Updated PyPI project links from the `fyltr/strawberry-django-aggregates`
+  repository to `ang-ee/strawberry-django-aggregates`. Metadata-only; no code,
+  SDL, or runtime behaviour changes.
+
 ## [0.6.0] — 2026-06-22
 
 ### Added
