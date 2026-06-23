@@ -26,7 +26,8 @@ jobs:
           python-version: "3.14"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8
+        # No floating v8 major tag published; pin the exact release.
+        uses: astral-sh/setup-uv@v8.2.0
 
       - name: Verify release version
         run: |
