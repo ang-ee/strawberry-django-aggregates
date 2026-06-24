@@ -299,6 +299,8 @@ def _natural_python_type(field: Field) -> Any:
         return uuid.UUID
     if name == "DurationField":
         return datetime.timedelta
+    if name == "JSONField":
+        return JSON
     if name in {"AutoField", "BigAutoField", "SmallAutoField"}:
         return strawberry.ID
     if name in {"ForeignKey", "OneToOneField"}:

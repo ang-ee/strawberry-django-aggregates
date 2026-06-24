@@ -5,6 +5,21 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.8.0] — 2026-06-24
+
+### Fixed
+
+- **Direct (whole-column) `JSONField` group-by key now emits the `JSON` scalar**
+  instead of `String`. Grouping on a bare `JSONField` (`group_by_fields=["metadata"]`,
+  no dot) buckets on the entire JSON value, which may be an object or array — the
+  prior `String` fallback stringified those buckets and broke round-tripping of
+  list/object keys. `_natural_python_type` now maps `JSONField → JSON`, so the
+  `<Model>GroupKey` field (and any explicitly-allowlisted MIN/MAX/ARRAY_AGG measure
+  over a direct JSON column) serializes structured values correctly. This is an SDL
+  type change on that key field (`String → JSON`); during the `0.x` line such
+  controlled changes ship in a minor. Dotted JSON paths (`metadata.region`, SPEC
+  § 6.1) are unaffected — they keep their declared-type token.
+
 ## [0.7.0] — 2026-06-24
 
 ### Added

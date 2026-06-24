@@ -685,6 +685,18 @@ properties. Stream 17 surfaces typed dotted-path access to those keys for both
 `property` field machinery: typed dotted-path access only, no per-property
 selection types, no virtual m2o / m2m, no `jsonb_array_elements` join.
 
+**Direct (whole-column) `JSONField` group_by.** Distinct from the dotted-path
+case below: grouping on the bare column (`metadata`, no dot) buckets on the
+*entire* JSON value, which may be an object or an array — not a scalar. Its
+`<Model>GroupKey` field therefore emits the **`JSON` scalar**, not `String`;
+dropping it to `String` would stringify object/array buckets and break
+round-tripping. This needs no `json_paths` entry (no key is addressed) and is
+group-by only — `JSONField` is absent from `default_operators_for`, so a direct
+JSON column is never a measure unless the caller explicitly allowlists ops for
+it (in which case MIN/MAX/ARRAY_AGG over it also surface as `JSON`). Dotted
+paths (`metadata.region`) are the typed-leaf case and follow the declared-type
+table below.
+
 **Wire format — dotted path.** The caller addresses a JSON key via
 `metadata.region` (single dot for one level of nesting). The same path is
 accepted by `compute_aggregation`, `AggregateBuilder`, and the GraphQL

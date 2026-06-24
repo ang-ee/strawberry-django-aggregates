@@ -109,7 +109,7 @@ from strawberry_django_aggregates.types import (
     make_having_input,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     # Builder (high-level)

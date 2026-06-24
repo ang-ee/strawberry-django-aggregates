@@ -376,3 +376,104 @@ def test_graphql_group_by_json_region(jsonb_orders):
     assert rows["south"]["sum"]["metadata_Amount"] == "350"
     assert rows["east"]["count"] == 1
     assert rows["east"]["sum"]["metadata_Amount"] == "75"
+
+
+def test_graphql_group_by_direct_json_field_returns_json_key(db):
+    """A direct JSONField group key keeps JSON, not String.
+
+    Direct JSONField grouping differs from ``metadata.region`` JSON-path
+    grouping: the bucket value can be an object or array. The GraphQL key
+    field must therefore use the JSON scalar so list values serialize.
+    """
+    from tests.models import Customer, Order
+
+    customer = Customer.objects.create(name="JSON-list-Co")
+    stamp = datetime.datetime(2026, 6, 1, 12, tzinfo=datetime.UTC)
+    payloads = (
+        ["strategy", "q3"],
+        ["strategy", "q3"],
+        ["support", "triage"],
+    )
+    for payload in payloads:
+        Order.objects.create(
+            customer=customer,
+            status="paid",
+            total=Decimal("10"),
+            quantity=1,
+            is_priority=False,
+            created_at=stamp,
+            metadata=payload,
+        )
+
+    def _build():
+        built = AggregateBuilder(
+            model=Order,
+            aggregate_fields=[],
+            group_by_fields=["metadata"],
+        ).build()
+
+        @strawberry.type
+        class Query:
+            orders_group_by: built.grouped_result_type = (
+                built.group_by_field
+            )
+
+        return strawberry.Schema(query=Query)
+
+    schema = _build()
+    sdl = schema.as_str()
+    assert "metadata: JSON" in sdl, sdl
+    assert "metadata: String" not in sdl, sdl
+    # Determinism (Critical Rule 2): a second independent build of the
+    # direct-JSONField group_by emits byte-identical SDL.
+    assert _build().as_str() == sdl
+
+    result = schema.execute_sync(
+        """
+        query {
+          ordersGroupBy(groupBy: [{ field: METADATA }]) {
+            results {
+              key { metadata }
+              count
+            }
+          }
+        }
+        """,
+    )
+
+    assert result.errors is None, result.errors
+    rows = {
+        tuple(row["key"]["metadata"]): row["count"]
+        for row in result.data["ordersGroupBy"]["results"]
+    }
+    assert rows == {
+        ("strategy", "q3"): 2,
+        ("support", "triage"): 1,
+    }
+
+
+def test_direct_json_measure_override_emits_json(db):
+    """An explicitly allowlisted JSONField measure surfaces as JSON.
+
+    ``JSONField`` is absent from ``default_operators_for`` (never a
+    measure by default), but a caller may allowlist MIN/MAX/ARRAY_AGG
+    on the bare column via ``operators``. The natural output type of
+    those ops over a JSON column is the JSON scalar, not String —
+    locking the SPEC § 6.1 promise for the override path.
+    """
+    from tests.models import Order
+
+    built = AggregateBuilder(
+        model=Order,
+        aggregate_fields=["metadata"],
+        group_by_fields=["status"],
+        operators={"metadata": (AggregateOp.MIN, AggregateOp.MAX)},
+    ).build()
+
+    @strawberry.type
+    class Query:
+        order_aggregate: built.aggregate_type = built.aggregate_field
+
+    sdl = strawberry.Schema(query=Query).as_str()
+    assert "type OrderMinFields {\n  metadata: JSON\n}" in sdl, sdl
+    assert "type OrderMaxFields {\n  metadata: JSON\n}" in sdl, sdl
