@@ -364,6 +364,7 @@ class AggregateBuilder:
             having_input=having_input,
             group_by_spec=group_by_spec,
             groupable_field_enum=groupable_field_enum,
+            group_order_input=group_order_input,
             aggregate_field=aggregate_field,
             group_by_field=group_by_field,
             grouped_connection_type=grouped_connection_type,
@@ -460,13 +461,13 @@ class AggregateBuilder:
             if filter is not None:
                 qs = apply_filters(filter, qs, info=info)
 
-            spec = builder._translate_group_by(group_by)
+            spec = builder.translate_group_by(group_by)
             op_args: dict[str, dict[str, Any]] = {}
             requested = builder._requested_aggregate_ops_grouped(
                 info, a_fields, op_args=op_args,
             )
-            having_dict = builder._translate_having(having, requested)
-            order_terms = builder._translate_order_by(
+            having_dict = builder.translate_having(having, requested)
+            order_terms = builder.translate_order_by(
                 order_by, spec, requested,
             )
             pagination = pagination or OffsetPaginationInput()
@@ -644,12 +645,12 @@ class AggregateBuilder:
             if filter is not None:
                 qs = apply_filters(filter, qs, info=info)
 
-            spec = builder._translate_group_by(group_by)
+            spec = builder.translate_group_by(group_by)
             op_args: dict[str, dict[str, Any]] = {}
             requested = builder._requested_aggregate_ops_grouped_connection(
                 info, a_fields, op_args=op_args,
             )
-            having_dict = builder._translate_having(having, requested)
+            having_dict = builder.translate_having(having, requested)
             ws = builder._resolve_week_start(week_start)
 
             # Validate first / last bounds. Relay convention: at most
@@ -1245,9 +1246,14 @@ class AggregateBuilder:
             return arg.lower() if arg.isupper() else arg
         return None
 
-    def _translate_group_by(
+    def translate_group_by(
         self, specs: list[Any],
     ) -> list[tuple[str, Any]]:
+        """Translate a ``[<Model>GroupBySpec]`` input list into the
+        ``[(field_path, granularity), …]`` ``spec`` ``compute_aggregation``
+        expects. Public composition seam: pair with :meth:`shape_group_key`
+        to build a custom grouped envelope.
+        """
         out: list[tuple[str, Any]] = []
         for s in specs:
             field_name = (
@@ -1297,7 +1303,7 @@ class AggregateBuilder:
                 return dotted
         return name
 
-    def _translate_having(
+    def translate_having(
         self, having: Any | None,
         requested: list[tuple[AggregateOp, str | None]],
     ) -> dict[str, Any]:
@@ -1340,12 +1346,17 @@ class AggregateBuilder:
             out[f"{measure}__{comparison}"] = value
         return out
 
-    def _translate_order_by(
+    def translate_order_by(
         self,
         order_by: list[Any] | None,
         spec: list[tuple[str, Any]],
         requested: list[tuple[AggregateOp, str | None]],
     ) -> list[tuple[str, str, str | None]]:
+        """Translate a ``[<Model>GroupOrderBy]`` input into the
+        ``[(alias, direction, nulls), …]`` ``order_by`` terms
+        ``compute_aggregation`` expects — ordering grouped results by a
+        dimension alias or an aggregate measure. Public composition seam.
+        """
         if not order_by:
             return []
         # Mirror :meth:`_shape_grouped`'s alias derivation: JSON-path
@@ -1532,17 +1543,21 @@ class AggregateBuilder:
             op_args=op_args, json_paths=self.json_paths,
         )
 
-    def _shape_grouped(
+    def _build_group_key_kwargs(
         self,
-        grouped_type: type,
-        group_key_type: type,
         row: dict[str, Any],
-        requested: list[tuple[AggregateOp, str | None]],
         spec: list[tuple[str, Any]],
-        op_args: dict[str, dict[str, Any]] | None = None,
         week_start: int = 1,
-        echo_filter: bool = False,
-    ) -> Any:
+    ) -> dict[str, Any]:
+        """Map one ``compute_aggregation`` row's group-by aliases to the
+        ``<Model>GroupKey`` constructor kwargs.
+
+        Single-sources the per-axis value derivation shared by the public
+        :meth:`shape_group_key` and :meth:`_shape_grouped` (which also needs
+        the kwargs dict for the filter echo, SPEC § 4.4): choices-enum
+        coercion and the TIME ``<alias>_range: BucketRange`` siblings
+        (SPEC § 7).
+        """
         key_kwargs: dict[str, Any] = {}
         for fp, grain in spec:
             # Resolve the axis to its leaf field + canonical row alias via
@@ -1607,6 +1622,60 @@ class AggregateBuilder:
                 key_kwargs[f"{alias}_range"] = BucketRange(
                     from_=from_, to=to,
                 )
+        return key_kwargs
+
+    def shape_group_key(
+        self,
+        group_key_type: type,
+        row: dict[str, Any],
+        spec: list[tuple[str, Any]],
+        *,
+        week_start: int = 1,
+    ) -> Any:
+        """Shape one ``compute_aggregation`` row into a typed
+        ``<Model>GroupKey`` instance.
+
+        Public companion to :func:`shape_aggregate_row`. A consumer that
+        builds its own grouped envelope — e.g. a Hasura/NDC ``{ key,
+        aggregate }`` shape pairing this typed key with the free
+        ``<Model>Aggregate`` — composes the two: this fills the key
+        (choices-enum members, FK ``_id`` columns, date buckets, and TIME
+        ``<alias>_range`` ``BucketRange`` siblings) and
+        :func:`shape_aggregate_row` fills the aggregate. ``spec`` is the
+        same ``[(field_path, granularity), …]`` list passed to
+        :func:`compute_aggregation`.
+
+        Note the asymmetry when JSON-path measures (SPEC § 6.1) are in
+        play: this method sources the JSON-path allowlist from the builder
+        (``self.json_paths``) automatically, but :func:`shape_aggregate_row`
+        is a free function that does not — pass it explicitly to keep the
+        aggregate side in parity::
+
+            key = builder.shape_group_key(group_key_type, row, spec)
+            agg = shape_aggregate_row(
+                aggregate_type, row, requested,
+                op_args=op_args, json_paths=builder.json_paths,
+            )
+
+        ``builder.json_paths`` is also carried on
+        :attr:`BuiltAggregates.json_paths` for exactly this re-emission.
+        """
+        return group_key_type(
+            **self._build_group_key_kwargs(row, spec, week_start)
+        )
+
+    def _shape_grouped(
+        self,
+        grouped_type: type,
+        group_key_type: type,
+        row: dict[str, Any],
+        requested: list[tuple[AggregateOp, str | None]],
+        spec: list[tuple[str, Any]],
+        op_args: dict[str, dict[str, Any]] | None = None,
+        week_start: int = 1,
+        echo_filter: bool = False,
+    ) -> Any:
+        key_kwargs = self._build_group_key_kwargs(row, spec, week_start)
         key = group_key_type(**key_kwargs)
 
         kwargs: dict[str, Any] = {
@@ -1940,6 +2009,7 @@ class BuiltAggregates:
     having_input:         type
     group_by_spec:        type
     groupable_field_enum: type
+    group_order_input:    type
     aggregate_field:      Any
     group_by_field:       Any
     grouped_connection_type:      type | None = None

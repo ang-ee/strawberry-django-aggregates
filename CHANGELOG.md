@@ -5,6 +5,39 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.7.0] — 2026-06-24
+
+### Added
+
+- **Public `AggregateBuilder.shape_group_key(group_key_type, row, spec, *,
+  week_start=1)`** — shapes one `compute_aggregation` row into a typed
+  `<Model>GroupKey` instance (choices-enum members, FK `_id` columns, date
+  buckets, and TIME `<alias>_range` `BucketRange` siblings). Public companion to
+  `shape_aggregate_row`: a consumer can pair the typed key with the free
+  `<Model>Aggregate` to build a custom grouped envelope (e.g. a Hasura/NDC
+  `{ key, aggregate }` shape) without reaching into private internals. Factored
+  out of the private `_shape_grouped` (both share `_build_group_key_kwargs`); no
+  behaviour or SDL change to the built grouped types.
+- **`shape_aggregate_row` and `make_group_order_input` added to the public
+  `__all__`** — both were already importable and depended upon; now part of the
+  blessed public surface.
+- **Public `AggregateBuilder.translate_group_by` / `translate_having` /
+  `translate_order_by`** — the wire→spec translators (parsing the
+  `<Model>GroupBySpec` / `<Model>Having` / `<Model>GroupOrderBy` inputs into the
+  tuples `compute_aggregation` accepts) are now public, so a consumer can build
+  its own grouped field/envelope by composing them with `shape_group_key` +
+  `shape_aggregate_row`. Renamed from the private `_translate_*` (internal
+  callers updated); no behaviour or SDL change.
+
+### Docs
+
+- Documented the JSON-path composition asymmetry between the two row-shapers:
+  `shape_group_key` is a method and sources the `json_paths` allowlist from the
+  builder automatically, whereas the `shape_aggregate_row` free function needs
+  `json_paths=builder.json_paths` passed explicitly to keep a JSON-path measure
+  in parity. Noted in the `shape_group_key` docstring and `docs/SPEC.md`
+  § public row-shapers.
+
 ## [0.6.1] — 2026-06-23
 
 ### Changed
