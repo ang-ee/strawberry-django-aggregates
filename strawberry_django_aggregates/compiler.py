@@ -1549,6 +1549,12 @@ def group_by_alias(
 ) -> str:
     """Canonical output alias for a (field, granularity) pair.
 
+    Public: the single owner of the group-key alias rule. The type
+    emitter, the resolver, cursor pagination (§ 4.1), and the having-echo
+    (§ 4.3) all derive their wire keys from this function so they cannot
+    drift. Consumers building their own grouped envelope MUST call this
+    rather than recompute the ``_id`` suffix or granularity suffix.
+
     - ``("customer", None)`` with FK field → ``"customer_id"``
     - ``("status",   None)`` with plain field → ``"status"``
     - ``("created_at", TimeGranularity.MONTH)`` → ``"created_at_month"``

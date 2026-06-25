@@ -23,6 +23,10 @@ Public surface:
   bucketing tokens (``date_trunc`` and ``date_part::int`` respectively).
 - :func:`parse_aggregate_order` — parser for ``"<field>:<op>"`` order
   terms; raises on unknown.
+- :func:`group_by_alias` — canonical output alias for a ``(field,
+  granularity)`` group-by pair (FK → ``<field>_id``, granularity →
+  ``<field>_<granularity>``, plain field → passthrough). The single owner
+  of this rule; consumers MUST NOT recompute it.
 - :data:`BigInt` — string-encoded 64-bit signed integer scalar. Output
   type for ``SUM`` over integer Django fields (Postgres widens to
   ``bigint``; the 32-bit GraphQL ``Int`` would silently overflow).
@@ -59,6 +63,7 @@ from strawberry_django_aggregates.builder import (
 from strawberry_django_aggregates.compiler import (
     bucket_range,
     compute_aggregation,
+    group_by_alias,
 )
 from strawberry_django_aggregates.errors import (
     AggregateError,
@@ -109,7 +114,7 @@ from strawberry_django_aggregates.types import (
     make_having_input,
 )
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     # Builder (high-level)
@@ -130,6 +135,9 @@ __all__ = [
     "NumberGranularity",
     "validate_week_start",
     "default_operators_for",
+    # Aliasing — canonical output alias for a (field, granularity) pair;
+    # consumers MUST NOT recompute (FK -> ``_id``, granularity suffix).
+    "group_by_alias",
     # Custom scalars
     "BigInt",
     # Bucket range — half-open [from, to) interval for TIME-granularity

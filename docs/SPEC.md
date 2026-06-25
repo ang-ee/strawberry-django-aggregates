@@ -1370,7 +1370,7 @@ tests/
 
 ## 16 · Versioning
 
-The `AggregateOp` enum and the `compute_aggregation` signature are part of the SemVer contract — breaking changes bump major. The Strawberry types it emits inherit Strawberry's evolution semantics (deprecate fields, never break them in a minor release). The library tracks `strawberry-graphql-django` minor versions; major bumps there may force a major bump here.
+The `AggregateOp` enum, the `compute_aggregation` signature, and the `group_by_alias` output contract (FK → `<field>_id`, granularity → `<field>_<granularity>`, plain field → passthrough) are part of the SemVer contract — breaking changes bump major. `group_by_alias` is the single owner of the group-key alias rule, referenced canonically at § 4.1 / § 4.3 / the type-emitter §; consumers building their own grouped envelope MUST call it rather than recompute the `_id` suffix. The Strawberry types it emits inherit Strawberry's evolution semantics (deprecate fields, never break them in a minor release). The library tracks `strawberry-graphql-django` minor versions; major bumps there may force a major bump here.
 
 ## 18 · Apollo Federation v2 support
 
