@@ -5,6 +5,23 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.9.0] — 2026-06-25
+
+### Added
+
+- **Public `group_by_alias(field_path, granularity, field=None)`** — the
+  canonical output alias for a `(field, granularity)` group-by pair (FK →
+  `<field>_id`, granularity → `<field>_<granularity>`, plain field →
+  passthrough). The function already owned this rule internally — the type
+  emitter, the resolver, cursor pagination (SPEC § 4.1), and the
+  having-echo (SPEC § 4.3) all derive their wire keys from it — but it was
+  absent from `__all__`. This promotes it to the blessed public surface so
+  consumers building their own grouped envelope (e.g. a Hasura/NDC
+  `{ key, aggregate }` shape) can call the one owner of the alias rule
+  instead of recomputing the `_id` suffix. Visibility-only promotion;
+  no behaviour, signature, or SDL change. Same change class as the 0.7.0
+  `shape_aggregate_row` / `make_group_order_input` promotions.
+
 ## [0.8.0] — 2026-06-24
 
 ### Fixed
