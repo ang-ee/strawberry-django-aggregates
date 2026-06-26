@@ -879,12 +879,9 @@ class AggregateBuilder:
         grouped-row shaping so both stay in lockstep with the compiler.
         """
         if self.json_paths and fp in self.json_paths:
-            base_alias = fp.replace(".", "__")
-            alias = (
-                f"{base_alias}_{grain.value}" if grain is not None
-                else base_alias
-            )
-            return None, alias
+            # JSON axes have no Django field; ``group_by_alias`` owns the
+            # ``.`` → ``__`` rewrite and the granularity suffix (SPEC § 16).
+            return None, group_by_alias(fp, grain)
         field = resolve_field_to_one_only(
             self.model, fp, GroupByFieldNotAllowed,
         )
@@ -1359,20 +1356,15 @@ class AggregateBuilder:
         """
         if not order_by:
             return []
-        # Mirror :meth:`_shape_grouped`'s alias derivation: JSON-path
-        # entries use the alias-form name (``metadata__region``) plus
-        # any granularity suffix; regular fields delegate to the
-        # standard :func:`group_by_alias` helper.
-        group_aliases: list[str] = []
-        for fp, gr in spec:
-            if self.json_paths and fp in self.json_paths:
-                base_alias = fp.replace(".", "__")
-                if gr is not None:
-                    group_aliases.append(f"{base_alias}_{gr.value}")
-                else:
-                    group_aliases.append(base_alias)
-            else:
-                group_aliases.append(group_by_alias(fp, gr, None))
+        # Every axis — JSON-path or regular field — delegates to
+        # :func:`group_by_alias`, which normalises the JSON ``.`` → ``__``
+        # rewrite and appends any granularity suffix (SPEC § 16). ``field``
+        # is passed ``None`` (so a bare FK path keeps its name rather than
+        # gaining ``_id``), preserving the pre-existing order-alias
+        # derivation unchanged.
+        group_aliases: list[str] = [
+            group_by_alias(fp, gr, None) for fp, gr in spec
+        ]
         # Translate requested aggregate ``(op, dotted)`` entries into the
         # alias-form ``(op, metadata__amount)`` so that
         # :func:`aggregate_aliases_from_spec` produces aliases matching

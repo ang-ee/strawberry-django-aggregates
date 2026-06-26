@@ -643,7 +643,7 @@ def compute_aggregation(
             queryset, bucket_field, fill_min, fill_max,
             post_having_rows=rows if having_q is not None else None,
             bucket_alias=(
-                f"{bucket_field}_{group_by[0][1].value}"
+                group_by_alias(bucket_field, group_by[0][1])
                 if bucket_field is not None
                 and isinstance(group_by[0][1], TimeGranularity)
                 else None
@@ -1454,7 +1454,7 @@ def _build_group_by_annotations(
                         f"{declared_type!r}; granularity is only "
                         f"meaningful on `date` / `datetime` paths.",
                     )
-                bucket_alias = f"{alias}_{granularity.value}"
+                bucket_alias = group_by_alias(alias, granularity)
                 annotations[bucket_alias] = _build_json_group_by_expression(
                     expression, granularity, declared_type,
                     tzinfo, week_start,
@@ -1550,23 +1550,35 @@ def group_by_alias(
     """Canonical output alias for a (field, granularity) pair.
 
     Public: the single owner of the group-key alias rule. The type
-    emitter, the resolver, cursor pagination (§ 4.1), and the having-echo
-    (§ 4.3) all derive their wire keys from this function so they cannot
-    drift. Consumers building their own grouped envelope MUST call this
-    rather than recompute the ``_id`` suffix or granularity suffix.
+    emitter, the resolver, cursor pagination (§ 4.1), the having-echo
+    (§ 4.3), and the dense-fill spine all derive their wire keys from
+    this function so they cannot drift. Consumers building their own
+    grouped envelope MUST call this rather than recompute the ``_id``
+    suffix, the granularity suffix, or the JSON ``.`` → ``__`` rewrite.
+
+    Dotted JSON paths are normalised to their column-alias form before
+    any suffix is applied — delegating to :func:`json_path_alias`, the
+    owner of the ``.`` → ``__`` rewrite (``metadata.region`` →
+    ``metadata__region``). Django model-field paths never contain ``.``,
+    so the rewrite is a no-op for them and existing model-field callers
+    are unaffected.
 
     - ``("customer", None)`` with FK field → ``"customer_id"``
     - ``("status",   None)`` with plain field → ``"status"``
     - ``("created_at", TimeGranularity.MONTH)`` → ``"created_at_month"``
     - ``("created_at", NumberGranularity.DAY_OF_WEEK)`` →
       ``"created_at_day_of_week"``
+    - ``("metadata.region", None)`` (JSON path) → ``"metadata__region"``
+    - ``("metadata.created_at", TimeGranularity.MONTH)`` (JSON path) →
+      ``"metadata__created_at_month"``
     """
+    base = json_path_alias(field_path)
     if granularity is not None:
-        return f"{field_path}_{granularity.value}"
+        return f"{base}_{granularity.value}"
     if field is not None and getattr(field, "is_relation", False) \
             and getattr(field, "many_to_one", False):
-        return f"{field_path}_id"
-    return field_path
+        return f"{base}_id"
+    return base
 
 
 def _build_group_by_expression(

@@ -11,16 +11,42 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 
 - **Public `group_by_alias(field_path, granularity, field=None)`** — the
   canonical output alias for a `(field, granularity)` group-by pair (FK →
-  `<field>_id`, granularity → `<field>_<granularity>`, plain field →
-  passthrough). The function already owned this rule internally — the type
-  emitter, the resolver, cursor pagination (SPEC § 4.1), and the
-  having-echo (SPEC § 4.3) all derive their wire keys from it — but it was
-  absent from `__all__`. This promotes it to the blessed public surface so
-  consumers building their own grouped envelope (e.g. a Hasura/NDC
+  `<field>_id`, granularity → `<field>_<granularity>`, JSON path →
+  `.`→`__` rewrite then any granularity suffix, plain field →
+  passthrough). Promoted to the blessed public surface so consumers
+  building their own grouped envelope (e.g. a Hasura/NDC
   `{ key, aggregate }` shape) can call the one owner of the alias rule
-  instead of recomputing the `_id` suffix. Visibility-only promotion;
-  no behaviour, signature, or SDL change. Same change class as the 0.7.0
-  `shape_aggregate_row` / `make_group_order_input` promotions.
+  instead of recomputing the `_id` / granularity / JSON-rewrite suffixes.
+  Same change class as the 0.7.0 `shape_aggregate_row` /
+  `make_group_order_input` promotions.
+
+### Changed
+
+- **`group_by_alias` is now the *enforced* single owner of the group-key
+  alias rule, not merely its documented home.** The type emitter
+  (`<Model>GroupKey` fields), the dense-fill spine, the JSON-path
+  annotation aliases (`compiler._build_group_by_annotations`), and the
+  order-term translation (`AggregateBuilder.translate_order_by`)
+  previously each recomputed the `_id` / `_<granularity>` / `.`→`__`
+  suffixes by hand; they now all route through `group_by_alias`, and the
+  function was extended to own the JSON `.`→`__` rewrite. This makes the
+  drift-prevention the public promotion advertises (SPEC § 16) actually
+  load-bearing. No public-signature change; the emitted SDL is
+  byte-identical (determinism test green).
+
+### Fixed
+
+- **Dense `fill=True` over a JSON *date path* now actually fills.** The
+  dense-fill spine keyed its bucket lookup off a hand-built dotted alias
+  (`metadata.created_at_iso_month`) that never matched the annotated row
+  key (`metadata__created_at_iso_month`), so the bucket map stayed empty,
+  the spine bounds collapsed, and every JSON-date-path fill silently
+  returned its rows unfilled — independent of `having` (a second
+  hand-built dotted alias in the post-HAVING bound derivation had the
+  same defect). Routing both sites through `group_by_alias` (which
+  normalises `.`→`__`) fixes the lookup. Model date-field fills were
+  unaffected (no `.` to rewrite). Regression test added in
+  `tests/test_jsonb_groupby.py`.
 
 ## [0.8.0] — 2026-06-24
 

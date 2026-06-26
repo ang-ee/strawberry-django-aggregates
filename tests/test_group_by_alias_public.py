@@ -58,3 +58,29 @@ def test_number_bucket_suffixes_with_granularity():
         group_by_alias("created_at", NumberGranularity.DAY_OF_WEEK)
         == "created_at_day_of_week"
     )
+
+
+def test_json_path_normalises_dot_to_double_underscore():
+    """A dotted JSON path → its column-alias form (``.`` → ``__``).
+
+    ``group_by_alias`` is the single owner of this rewrite (SPEC § 16);
+    the type emitter, the resolver, cursor pagination, the having-echo,
+    and the dense-fill spine all route JSON axes through it so the wire
+    keys cannot drift. A model-field path never contains ``.``, so the
+    rewrite is a no-op for the non-JSON cases above.
+    """
+    assert group_by_alias("metadata.region", None) == "metadata__region"
+
+
+def test_json_path_applies_granularity_after_rewrite():
+    """A dotted JSON path with granularity → rewrite, then suffix."""
+    assert (
+        group_by_alias("metadata.created_at", TimeGranularity.MONTH)
+        == "metadata__created_at_month"
+    )
+    assert (
+        group_by_alias(
+            "metadata.created_at", NumberGranularity.DAY_OF_WEEK,
+        )
+        == "metadata__created_at_day_of_week"
+    )
