@@ -38,10 +38,8 @@ import strawberry.federation
 from strawberry.scalars import JSON
 from strawberry_django.pagination import OffsetPaginationInfo
 
-from strawberry_django_aggregates.compiler import (
-    group_by_alias,
-    resolve_field_to_one_only,
-)
+from strawberry_django_aggregates.aliasing import group_by_alias
+from strawberry_django_aggregates.compiler import resolve_field_to_one_only
 from strawberry_django_aggregates.errors import (
     ChoicesEnumCollisionError,
     ChoicesEnumNameError,
@@ -1142,7 +1140,7 @@ def _emit_group_key(
     Optional, plus bucket fields for date/datetime entries.
 
     Bucket field names follow the alias convention
-    :func:`compiler.group_by_alias` (e.g. ``created_at_month``,
+    :func:`aliasing.group_by_alias` (e.g. ``created_at_month``,
     ``created_at_day_of_week``). Caller-side resolver populates only
     the keys present in the actual ``group_by`` request.
 

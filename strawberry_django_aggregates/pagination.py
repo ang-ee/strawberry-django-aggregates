@@ -10,7 +10,7 @@ Cursor wire format
 
 Cursors are an opaque base64-encoded JSON list of group-by alias values
 in canonical order (the order the caller supplies in ``group_by`` is
-preserved verbatim — see :func:`compiler.group_by_alias`). The list
+preserved verbatim — see :func:`aliasing.group_by_alias`). The list
 encodes the **trailing** value of an emitted page row, so the next
 page's keyset filter is ``(a, b, c) > (cursor_a, cursor_b, cursor_c)``.
 

@@ -57,6 +57,7 @@ See ``docs/SPEC.md`` for the full contract.
 
 from __future__ import annotations
 
+from strawberry_django_aggregates.aliasing import group_by_alias
 from strawberry_django_aggregates.builder import (
     AggregateBuilder,
     shape_aggregate_row,
@@ -64,7 +65,6 @@ from strawberry_django_aggregates.builder import (
 from strawberry_django_aggregates.compiler import (
     bucket_range,
     compute_aggregation,
-    group_by_alias,
 )
 from strawberry_django_aggregates.errors import (
     AggregateError,
@@ -115,7 +115,7 @@ from strawberry_django_aggregates.types import (
     make_having_input,
 )
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 __all__ = [
     # Builder (high-level)

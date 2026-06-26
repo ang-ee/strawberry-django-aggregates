@@ -17,12 +17,9 @@ Implementation strategy: post-process Python merge rather than SQL
 - Cardinality is bounded for analytics-shaped queries; bucket counts
   rarely exceed 10000 even on multi-year ``DAY``-grain queries.
 
-CLAUDE.md Critical Rule 9 — this module has no GraphQL/Strawberry
-coupling. At load time it imports only stdlib + the pure ``granularity``
-enums; the one intra-package helper it needs, ``group_by_alias`` (the
-single owner of the bucket-alias rule), is pulled from ``compiler``
-lazily inside ``fill_bucket_results`` so importing this module stays
-free of the Django-heavy ``compiler``.
+CLAUDE.md Critical Rule 9 — this module is framework-agnostic. Pure
+stdlib + the pure ``aliasing`` / ``granularity`` modules. No Django,
+no Strawberry.
 """
 
 from __future__ import annotations
@@ -31,6 +28,7 @@ import datetime
 from collections.abc import Iterator
 from typing import Any
 
+from strawberry_django_aggregates.aliasing import group_by_alias
 from strawberry_django_aggregates.granularity import (
     Granularity,
     TimeGranularity,
@@ -208,22 +206,15 @@ def fill_bucket_results(
       to the spine value.
     - Output is sorted ascending by the bucket alias.
 
-    This function's logic is pure (no side effects, stdlib + pure
-    helpers) and can be called from any Python context. CLAUDE.md
-    Critical Rule 9.
+    This function is pure (no side effects; stdlib + pure helpers) — it
+    can be called from any Python context. CLAUDE.md Critical Rule 9.
     """
-    # ``group_by_alias`` is the single owner of the bucket-alias rule
-    # (SPEC § 16); deriving the key here rather than recomputing
-    # ``f"{field_path}_{grain}"`` keeps this lookup in lockstep with the
-    # alias the compiler annotated (notably the JSON ``.`` → ``__``
-    # rewrite). There is no import cycle — ``compiler`` imports this
-    # module only function-locally — so this lazy import exists purely to
-    # keep ``fill``'s load-time footprint free of the Django-heavy
-    # ``compiler``.
-    from strawberry_django_aggregates.compiler import group_by_alias
-
     # Locate the single TIME-granularity bucket entry. Caller has already
-    # validated this; the second pass here is defensive.
+    # validated this; the second pass here is defensive. ``group_by_alias``
+    # is the single owner of the bucket-alias rule (SPEC § 16) — deriving
+    # the key here rather than recomputing ``f"{field_path}_{grain}"``
+    # keeps this lookup in lockstep with the alias the compiler annotated
+    # (notably the JSON ``.`` → ``__`` rewrite).
     bucket_alias: str | None = None
     bucket_grain: TimeGranularity | None = None
     for field_path, granularity in group_by_spec:

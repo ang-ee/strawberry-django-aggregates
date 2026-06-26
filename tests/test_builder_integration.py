@@ -87,6 +87,38 @@ def test_group_by_query(order_schema):
 
 
 @pytest.mark.django_db
+def test_group_by_order_by_fk_dimension(order_schema):
+    """Ordering grouped results by an FK group-by dimension works.
+
+    Regression: ``translate_order_by`` built its validation namespace
+    with the bare FK name (``customer``) rather than the ``customer_id``
+    alias that the ``GroupKey`` exposes and that ``compute_aggregation``
+    validates against, so ``orderBy: { field: "customer_id" }`` raised
+    ``OrderFieldNotAllowed`` (and ``field: "customer"`` raised it
+    mid-resolver instead). Exercised through the builder because the
+    primitive bypasses ``translate_order_by``.
+    """
+    schema, _ = order_schema
+    result = schema.execute_sync('''
+        query {
+            ordersGroupBy(
+                groupBy: [{ field: CUSTOMER }]
+                orderBy: [{ field: "customer_id", direction: DESC }]
+            ) {
+                results { key { customerId } count }
+            }
+        }
+    ''')
+    assert result.errors is None, result.errors
+    keys = [
+        r["key"]["customerId"]
+        for r in result.data["ordersGroupBy"]["results"]
+    ]
+    assert keys == sorted(keys, reverse=True)
+    assert len(keys) == 3
+
+
+@pytest.mark.django_db
 def test_group_by_with_having(order_schema):
     schema, _ = order_schema
     result = schema.execute_sync("""

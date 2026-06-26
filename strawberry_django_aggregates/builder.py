@@ -33,11 +33,11 @@ from strawberry_django.pagination import (
 )
 from strawberry_django.settings import strawberry_django_settings
 
+from strawberry_django_aggregates.aliasing import group_by_alias
 from strawberry_django_aggregates.compiler import (
     HAVING_COMPARISONS,
     bucket_range,
     compute_aggregation,
-    group_by_alias,
     resolve_field_to_one_only,
 )
 from strawberry_django_aggregates.errors import (
@@ -871,7 +871,7 @@ class AggregateBuilder:
         including forward to-one relation paths (SPEC § 6.2) — resolve
         the leaf field via the shared
         :func:`compiler.resolve_field_to_one_only` and derive the
-        canonical alias with :func:`compiler.group_by_alias`, identical
+        canonical alias with :func:`aliasing.group_by_alias`, identical
         to the compiler, so the alias round-trips onto the ``.values()``
         column. A to-many segment anywhere in the path fails loud with
         ``AggregationAcrossRelationError`` (SPEC § 11). This is the
@@ -1356,14 +1356,18 @@ class AggregateBuilder:
         """
         if not order_by:
             return []
-        # Every axis — JSON-path or regular field — delegates to
-        # :func:`group_by_alias`, which normalises the JSON ``.`` → ``__``
-        # rewrite and appends any granularity suffix (SPEC § 16). ``field``
-        # is passed ``None`` (so a bare FK path keeps its name rather than
-        # gaining ``_id``), preserving the pre-existing order-alias
-        # derivation unchanged.
+        # Derive the order-validation namespace from the SAME shared
+        # resolver the row-shaping and cursor-key paths use, so an FK axis
+        # resolves to its ``<fk>_id`` alias — matching both the emitted
+        # ``GroupKey`` field and the compiler's order-term namespace
+        # (``compute_aggregation`` validates the canonical term against the
+        # ``.values()`` aliases, which carry ``_id`` for FKs). Deriving it
+        # with ``field=None`` here yielded the bare FK name and made
+        # FK-dimension ordering raise ``OrderFieldNotAllowed`` in both
+        # directions. JSON / date-bucket / plain-field aliases are
+        # unchanged.
         group_aliases: list[str] = [
-            group_by_alias(fp, gr, None) for fp, gr in spec
+            self._group_axis_field_and_alias(fp, gr)[1] for fp, gr in spec
         ]
         # Translate requested aggregate ``(op, dotted)`` entries into the
         # alias-form ``(op, metadata__amount)`` so that

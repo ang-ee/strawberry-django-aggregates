@@ -241,7 +241,7 @@ def _resolve_fk_field(model: type[Any], fk_alias: str) -> Any:
     Tries two strategies in order: lookup by ``attname`` (the actual
     column name Django emits, e.g. ``customer_id``) and lookup by the
     alias minus a trailing ``_id``. Both are needed because
-    :func:`compiler.group_by_alias` appends ``_id`` to FK names but
+    :func:`aliasing.group_by_alias` appends ``_id`` to FK names but
     Django's ``get_field`` accepts the bare FK name too.
     """
     meta = getattr(model, "_meta", None)

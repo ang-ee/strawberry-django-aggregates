@@ -198,7 +198,7 @@ type PageInfo {
 
 **Connection arguments.** `first: Int`, `after: String`, `last: Int`, `before: String` (Relay convention; `first` and `last` mutually exclusive, both non-negative). Plus `groupBy`, `having`, `weekStart`, and `filter` (when wired) for parity with the offset field. Out of scope on the cursor field for v1.0: `orderBy` (would break keyset semantics — the canonical group-alias ordering is forced for stability) and `fill` (the dense spine has no obvious cursor encoding for filler buckets — use the offset variant).
 
-**Cursor format.** Opaque base64-URL-safe encoding of a JSON list of group-by alias values in canonical order — the same order the caller supplies in `group_by` (mirrors `compiler.group_by_alias`). Datetimes / dates / times serialize as ISO-8601 strings tagged with one-letter type markers (`["dt", "2026-05-01T00:00:00+00:00"]`); `Decimal` survives via a `["dec", "100.00"]` tag. Pure stdlib (`base64`, `json`, `datetime`, `decimal`) — no Django, no Strawberry. The encoder is deterministic: same input ⇒ byte-identical output.
+**Cursor format.** Opaque base64-URL-safe encoding of a JSON list of group-by alias values in canonical order — the same order the caller supplies in `group_by` (mirrors `aliasing.group_by_alias`). Datetimes / dates / times serialize as ISO-8601 strings tagged with one-letter type markers (`["dt", "2026-05-01T00:00:00+00:00"]`); `Decimal` survives via a `["dec", "100.00"]` tag. Pure stdlib (`base64`, `json`, `datetime`, `decimal`) — no Django, no Strawberry. The encoder is deterministic: same input ⇒ byte-identical output.
 
 ```python
 from strawberry_django_aggregates import (

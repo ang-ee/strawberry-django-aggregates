@@ -5,6 +5,38 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.9.1] — 2026-06-26
+
+### Fixed
+
+- **Ordering grouped results by a foreign-key dimension now works.**
+  `AggregateBuilder.translate_order_by` built its order-validation
+  namespace with the bare FK path (`customer`) instead of the
+  `customer_id` alias that the `GroupKey` exposes and that
+  `compute_aggregation` validates against. Ordering by the FK dimension
+  therefore raised `OrderFieldNotAllowed` in both directions (`field:
+  "customer_id"` failed at translate time; `field: "customer"` failed
+  mid-resolver). `translate_order_by` now derives the namespace from the
+  same shared `_group_axis_field_and_alias` resolver the row-shaping and
+  cursor-key paths use, so FK axes resolve to `<fk>_id`. JSON / date-
+  bucket / plain-field ordering is unchanged. Regression test in
+  `tests/test_builder_integration.py` (exercised through the builder
+  because the primitive bypasses `translate_order_by`).
+
+### Changed
+
+- **`group_by_alias` and `json_path_alias` moved to a new pure leaf
+  module `strawberry_django_aggregates.aliasing`.** They are pure string
+  logic with no Django dependency, so housing them in the Django-heavy
+  `compiler` forced `fill` (a framework-agnostic module) into a
+  call-time lazy import and left its "no Django" contract stale. The
+  leaf module lets `fill`, `compiler`, `types`, and `builder` import the
+  alias rule at top level with no import cycle and no Django pull-through,
+  restoring `fill`'s framework-agnostic guarantee. Public import path is
+  unchanged — `from strawberry_django_aggregates import group_by_alias`
+  still works (re-exported); the submodule location was never part of the
+  SemVer surface. No SDL change (determinism test green).
+
 ## [0.9.0] — 2026-06-25
 
 ### Added

@@ -51,6 +51,10 @@ from django.db.models import (
 from django.db.models.functions import Cast, Coalesce, Concat, Extract, Trunc
 from django.db.models.functions.datetime import TimezoneMixin
 
+from strawberry_django_aggregates.aliasing import (
+    group_by_alias,
+    json_path_alias,
+)
 from strawberry_django_aggregates.errors import (
     AggregateError,
     AggregationAcrossRelationError,
@@ -1165,22 +1169,6 @@ def _is_dotted_json_path(model: Any, field_path: str) -> bool:
     return _is_json_field(field)
 
 
-def json_path_alias(field_path: str) -> str:
-    """Convert a dotted JSON path to its Django-friendly alias.
-
-    ``"metadata.region"`` → ``"metadata__region"``. Used as the kwarg
-    name when annotating, the ``.values()`` argument when grouping, and
-    the column name in the result row dict.
-
-    The double-underscore separator matches Django's own convention for
-    relation traversal aliases (``customer__name``); the alias never
-    triggers Django's relation walker because it appears as an
-    annotation kwarg, not as a path on a queryset's ``.filter`` /
-    ``.values``.
-    """
-    return field_path.replace(".", "__")
-
-
 def _resolve_json_path(
     model: Any,
     field_path: str,
@@ -1540,45 +1528,6 @@ def _build_json_group_by_expression(
     raise GranularityNotApplicable(  # defensive
         f"Unknown granularity {granularity!r}.",
     )
-
-
-def group_by_alias(
-    field_path: str,
-    granularity: Granularity | None,
-    field: Field | None = None,
-) -> str:
-    """Canonical output alias for a (field, granularity) pair.
-
-    Public: the single owner of the group-key alias rule. The type
-    emitter, the resolver, cursor pagination (§ 4.1), the having-echo
-    (§ 4.3), and the dense-fill spine all derive their wire keys from
-    this function so they cannot drift. Consumers building their own
-    grouped envelope MUST call this rather than recompute the ``_id``
-    suffix, the granularity suffix, or the JSON ``.`` → ``__`` rewrite.
-
-    Dotted JSON paths are normalised to their column-alias form before
-    any suffix is applied — delegating to :func:`json_path_alias`, the
-    owner of the ``.`` → ``__`` rewrite (``metadata.region`` →
-    ``metadata__region``). Django model-field paths never contain ``.``,
-    so the rewrite is a no-op for them and existing model-field callers
-    are unaffected.
-
-    - ``("customer", None)`` with FK field → ``"customer_id"``
-    - ``("status",   None)`` with plain field → ``"status"``
-    - ``("created_at", TimeGranularity.MONTH)`` → ``"created_at_month"``
-    - ``("created_at", NumberGranularity.DAY_OF_WEEK)`` →
-      ``"created_at_day_of_week"``
-    - ``("metadata.region", None)`` (JSON path) → ``"metadata__region"``
-    - ``("metadata.created_at", TimeGranularity.MONTH)`` (JSON path) →
-      ``"metadata__created_at_month"``
-    """
-    base = json_path_alias(field_path)
-    if granularity is not None:
-        return f"{base}_{granularity.value}"
-    if field is not None and getattr(field, "is_relation", False) \
-            and getattr(field, "many_to_one", False):
-        return f"{base}_id"
-    return base
 
 
 def _build_group_by_expression(
