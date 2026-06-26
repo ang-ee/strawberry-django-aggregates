@@ -38,7 +38,10 @@ import strawberry.federation
 from strawberry.scalars import JSON
 from strawberry_django.pagination import OffsetPaginationInfo
 
-from strawberry_django_aggregates.compiler import resolve_field_to_one_only
+from strawberry_django_aggregates.compiler import (
+    group_by_alias,
+    resolve_field_to_one_only,
+)
 from strawberry_django_aggregates.errors import (
     ChoicesEnumCollisionError,
     ChoicesEnumNameError,
@@ -1155,24 +1158,28 @@ def _emit_group_key(
         # whose Python type derives from the declared JSON token.
         if json_paths and field_name in json_paths:
             declared_type = json_paths[field_name]
-            alias_name = field_name.replace(".", "__")
+            # ``group_by_alias`` owns the JSON ``.`` → ``__`` rewrite and
+            # the per-granularity suffix (SPEC § 16) so these key names
+            # cannot drift from the resolver's emitted aliases.
+            alias_name = group_by_alias(field_name, None)
             py_type = _natural_python_type_for_json(declared_type)
             key_fields.append((alias_name, (py_type | None), None))
             if declared_type in {"date", "datetime"}:
                 for time_grain in TimeGranularity:
+                    bucket = group_by_alias(field_name, time_grain)
                     key_fields.append((
-                        f"{alias_name}_{time_grain.value}",
+                        bucket,
                         (datetime.datetime | None),
                         None,
                     ))
                     key_fields.append((
-                        f"{alias_name}_{time_grain.value}_range",
+                        f"{bucket}_range",
                         (BucketRange | None),
                         None,
                     ))
                 for num_grain in NumberGranularity:
                     key_fields.append((
-                        f"{alias_name}_{num_grain.value}",
+                        group_by_alias(field_name, num_grain),
                         (int | None),
                         None,
                     ))
@@ -1189,7 +1196,7 @@ def _emit_group_key(
         # FK fields surface as `<name>_id` per SPEC § 4.
         if getattr(field, "many_to_one", False):
             py_type = _natural_python_type(field)  # type: ignore[arg-type]
-            fk_id_name = f"{field_name}_id"
+            fk_id_name = group_by_alias(field_name, None, field)
             key_fields.append((fk_id_name, (py_type | None), None))
             fk_field_names.append(fk_id_name)
         else:
@@ -1217,19 +1224,20 @@ def _emit_group_key(
         # sibling.
         if type(field).__name__ in {"DateField", "DateTimeField"}:
             for time_grain in TimeGranularity:
+                bucket = group_by_alias(field_name, time_grain)
                 key_fields.append((
-                    f"{field_name}_{time_grain.value}",
+                    bucket,
                     (datetime.datetime | None),
                     None,
                 ))
                 key_fields.append((
-                    f"{field_name}_{time_grain.value}_range",
+                    f"{bucket}_range",
                     (BucketRange | None),
                     None,
                 ))
             for num_grain in NumberGranularity:
                 key_fields.append((
-                    f"{field_name}_{num_grain.value}",
+                    group_by_alias(field_name, num_grain),
                     (int | None),
                     None,
                 ))

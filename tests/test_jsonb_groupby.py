@@ -169,6 +169,36 @@ def test_group_by_metadata_datetime_with_month_granularity(jsonb_orders):
     assert counts == [2, 4]
 
 
+def test_fill_over_json_date_path_fills_gaps(jsonb_orders):
+    """Dense ``fill=True`` over a JSON *date path* fills empty buckets.
+
+    Regression for the dense-fill spine keying its bucket lookup off the
+    column-alias form. Before ``group_by_alias`` owned the JSON
+    ``.`` → ``__`` rewrite, fill built a dotted key
+    (``metadata.created_at_iso_month``) that never matched the annotated
+    row (``metadata__created_at_iso_month``); the bucket map stayed empty
+    and the fill silently dropped the real rows. The fixture holds
+    April (2) and May (4); a Feb–May window must surface Feb/Mar as
+    zero-count fillers while preserving the real April/May counts.
+    """
+    from tests.models import Order
+
+    rows = compute_aggregation(
+        Order.objects.all(),
+        group_by=[("metadata.created_at_iso", TimeGranularity.MONTH)],
+        aggregates=[(AggregateOp.COUNT, None)],
+        json_paths={"metadata.created_at_iso": "datetime"},
+        fill=True,
+        fill_min=datetime.datetime(2026, 2, 1, tzinfo=datetime.UTC),
+        fill_max=datetime.datetime(2026, 5, 1, tzinfo=datetime.UTC),
+    )
+    by_month = {
+        r["metadata__created_at_iso_month"].month: r["count"]
+        for r in rows
+    }
+    assert by_month == {2: 0, 3: 0, 4: 2, 5: 4}
+
+
 def test_having_on_json_sum(jsonb_orders):
     """HAVING with ``sum_metadata__amount__gt`` filters group buckets."""
     from tests.models import Order

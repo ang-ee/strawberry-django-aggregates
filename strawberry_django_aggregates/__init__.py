@@ -25,8 +25,9 @@ Public surface:
   terms; raises on unknown.
 - :func:`group_by_alias` — canonical output alias for a ``(field,
   granularity)`` group-by pair (FK → ``<field>_id``, granularity →
-  ``<field>_<granularity>``, plain field → passthrough). The single owner
-  of this rule; consumers MUST NOT recompute it.
+  ``<field>_<granularity>``, JSON path → ``.`` → ``__`` rewrite then any
+  granularity suffix, plain field → passthrough). The enforced single
+  owner of this rule; consumers MUST NOT recompute it.
 - :data:`BigInt` — string-encoded 64-bit signed integer scalar. Output
   type for ``SUM`` over integer Django fields (Postgres widens to
   ``bigint``; the 32-bit GraphQL ``Int`` would silently overflow).
@@ -135,8 +136,9 @@ __all__ = [
     "NumberGranularity",
     "validate_week_start",
     "default_operators_for",
-    # Aliasing — canonical output alias for a (field, granularity) pair;
-    # consumers MUST NOT recompute (FK -> ``_id``, granularity suffix).
+    # Aliasing — enforced single owner of the (field, granularity) → alias
+    # rule; consumers MUST NOT recompute (FK -> ``_id``, granularity
+    # suffix, JSON ``.`` -> ``__`` rewrite).
     "group_by_alias",
     # Custom scalars
     "BigInt",

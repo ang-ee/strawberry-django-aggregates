@@ -17,8 +17,12 @@ Implementation strategy: post-process Python merge rather than SQL
 - Cardinality is bounded for analytics-shaped queries; bucket counts
   rarely exceed 10000 even on multi-year ``DAY``-grain queries.
 
-CLAUDE.md Critical Rule 9 — this module is framework-agnostic. Pure
-stdlib + the local ``granularity`` module. No Django, no Strawberry.
+CLAUDE.md Critical Rule 9 — this module has no GraphQL/Strawberry
+coupling. At load time it imports only stdlib + the pure ``granularity``
+enums; the one intra-package helper it needs, ``group_by_alias`` (the
+single owner of the bucket-alias rule), is pulled from ``compiler``
+lazily inside ``fill_bucket_results`` so importing this module stays
+free of the Django-heavy ``compiler``.
 """
 
 from __future__ import annotations
@@ -204,9 +208,20 @@ def fill_bucket_results(
       to the spine value.
     - Output is sorted ascending by the bucket alias.
 
-    This function is pure (no side effects) and stdlib-only — it can be
-    called from any Python context. CLAUDE.md Critical Rule 9.
+    This function's logic is pure (no side effects, stdlib + pure
+    helpers) and can be called from any Python context. CLAUDE.md
+    Critical Rule 9.
     """
+    # ``group_by_alias`` is the single owner of the bucket-alias rule
+    # (SPEC § 16); deriving the key here rather than recomputing
+    # ``f"{field_path}_{grain}"`` keeps this lookup in lockstep with the
+    # alias the compiler annotated (notably the JSON ``.`` → ``__``
+    # rewrite). There is no import cycle — ``compiler`` imports this
+    # module only function-locally — so this lazy import exists purely to
+    # keep ``fill``'s load-time footprint free of the Django-heavy
+    # ``compiler``.
+    from strawberry_django_aggregates.compiler import group_by_alias
+
     # Locate the single TIME-granularity bucket entry. Caller has already
     # validated this; the second pass here is defensive.
     bucket_alias: str | None = None
@@ -218,7 +233,7 @@ def fill_bucket_results(
                     "fill=True requires exactly one TIME-granularity "
                     "bucket in group_by; found multiple.",
                 )
-            bucket_alias = f"{field_path}_{granularity.value}"
+            bucket_alias = group_by_alias(field_path, granularity)
             bucket_grain = granularity
     if bucket_alias is None or bucket_grain is None:
         raise ValueError(
