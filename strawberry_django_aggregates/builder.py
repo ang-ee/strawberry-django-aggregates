@@ -41,6 +41,7 @@ from strawberry_django_aggregates.compiler import (
     resolve_field_to_one_only,
 )
 from strawberry_django_aggregates.errors import (
+    AggregateError,
     ChoicesValueNotInEnumError,
     FilterEchoError,
     GroupByFieldNotAllowed,
@@ -520,7 +521,7 @@ class AggregateBuilder:
                     week_start=ws, fill_min=fmin, fill_max=fmax,
                 )
             else:
-                total = builder._count_groups(
+                total = builder.count_groups(
                     qs, spec, requested, having_dict, op_args=op_args,
                     week_start=ws,
                 )
@@ -706,7 +707,7 @@ class AggregateBuilder:
                 if backward:
                     rows = list(reversed(rows))
 
-            total = builder._count_groups(
+            total = builder.count_groups(
                 qs, spec, requested, having_dict,
                 op_args=op_args, week_start=ws,
             )
@@ -1438,7 +1439,7 @@ class AggregateBuilder:
         """Total bucket count after empty-bucket filling, ignoring
         offset/limit.
 
-        The standard ``_count_groups`` path emits ``SELECT COUNT(*) FROM
+        The standard ``count_groups`` path emits ``SELECT COUNT(*) FROM
         (SELECT DISTINCT ...)`` which only sees populated buckets — it
         would under-count when ``fill=True`` is in effect. We compute
         the total by running the full filled aggregation (without
@@ -1462,17 +1463,23 @@ class AggregateBuilder:
         )
         return len(rows)
 
-    def _count_groups(
+    def count_groups(
         self,
         qs: QuerySet,
         spec: list[tuple[str, Any]],
         requested: list[tuple[AggregateOp, str | None]],
         having_dict: dict[str, Any],
+        *,
         op_args: dict[str, dict[str, Any]] | None = None,
         week_start: int = 1,
+        tz: str | None = None,
     ) -> int:
-        """Total distinct group buckets matching the request, ignoring
-        offset/limit.
+        """Return the exact database-side group cardinality before paging.
+
+        This is the public composition seam for custom grouped envelopes.
+        Callers pass the same translated group specification, requested
+        aggregates, and HAVING mapping as their row query; ordering, offset,
+        and limit do not affect the result.
 
         - **No HAVING:** ``qs.values(*group_aliases).distinct().count()``
           — DB-side de-dup, single ``SELECT COUNT(*) FROM (SELECT
@@ -1484,10 +1491,10 @@ class AggregateBuilder:
         version called :func:`compute_aggregation` and ``len()``-ed
         the list, which fetched every group row.
 
-        ``week_start`` mirrors ``compute_aggregation`` so the COUNT
-        groups by the same WEEK / DAY_OF_WEEK boundaries the data
-        query uses. Counting with a different ``week_start`` would
-        report a different bucket cardinality than the page returns.
+        ``week_start`` and ``tz`` mirror ``compute_aggregation`` so the
+        COUNT groups by the same temporal boundaries the data query uses.
+        Counting with different temporal settings could report a different
+        bucket cardinality than the page returns.
         """
         from django.conf import settings
         from django.db import connections
@@ -1497,13 +1504,22 @@ class AggregateBuilder:
             _build_group_by_annotations,
             _build_having_q,
             _resolve_tzinfo,
+            _validate_postgres_only,
         )
 
+        week_start = self._resolve_week_start(week_start)
+        if having_dict and not spec:
+            raise AggregateError(
+                "HAVING requires a non-empty `group_by` — there is nothing "
+                "to filter without group buckets. Add a `group_by` or "
+                "filter on the queryset directly with `.filter(...)`."
+            )
         if not spec:
             return 1
 
         vendor = connections[qs.db].vendor
-        tzinfo = _resolve_tzinfo(settings.TIME_ZONE)
+        _validate_postgres_only(requested, vendor)
+        tzinfo = _resolve_tzinfo(tz or settings.TIME_ZONE)
         group_ann, group_aliases = _build_group_by_annotations(
             qs.model, spec, tzinfo, week_start, self.json_paths,
         )

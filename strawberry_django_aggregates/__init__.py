@@ -16,6 +16,8 @@ Public surface:
 - :meth:`AggregateBuilder.shape_group_key` — fill a typed
   ``<Model>GroupKey`` from one row; pair with the free ``<Model>Aggregate``
   (via :func:`shape_aggregate_row`) to build a custom grouped envelope.
+- :meth:`AggregateBuilder.count_groups` — return the exact database-side
+  group cardinality before pagination for a custom grouped envelope.
 - :func:`make_group_order_input` — generate the ``<Model>GroupOrderBy``
   input (order grouped results by dimension or aggregate).
 - :class:`AggregateOp` — enum of aggregate operators.
@@ -115,7 +117,7 @@ from strawberry_django_aggregates.types import (
     make_having_input,
 )
 
-__version__ = "0.9.1"
+__version__ = "0.10.0"
 
 __all__ = [
     # Builder (high-level)

@@ -5,6 +5,19 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.10.0] — 2026-07-15
+
+### Added
+
+- **Public `AggregateBuilder.count_groups(...)`.** Custom grouped envelopes can
+  now ask the aggregation owner for their exact database-side cardinality
+  before pagination. The method promotes the count path already used by the
+  native offset and cursor grouped resolvers: it emits a distinct group count
+  without `HAVING`, or counts the post-aggregate rows when `HAVING` is present.
+  Filters remain queryset-owned, while date granularity, time zone, week start,
+  backend validation, and JSON-path aliases match the row query. No consumer
+  needs to materialize every group or import compiler internals.
+
 ## [0.9.1] — 2026-06-26
 
 ### Fixed
