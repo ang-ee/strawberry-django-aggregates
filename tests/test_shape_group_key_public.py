@@ -157,3 +157,41 @@ def test_shape_group_key_json_path_axis_parity(sample_orders):
             json_paths=builder.json_paths,
         )
         assert aggregate.count == int(row["count"])
+
+
+@pytest.mark.django_db
+def test_group_key_encoders_preserve_rows_nulls_and_other_axes(sample_orders):
+    from tests.models import Order
+
+    builder = AggregateBuilder(
+        model=Order, aggregate_fields=["total"],
+        group_by_fields=["customer", "status", "created_at"],
+    )
+    built = builder.build()
+    calls = []
+
+    def encode(value):
+        calls.append(value)
+        return f"customer-{value}"
+
+    row = {"customer_id": 7, "status": "paid", "sum__total": 10}
+    key = builder.shape_group_key(
+        built.group_key_type, row,
+        [("customer", None), ("status", None)],
+        value_encoders={"customer": encode},
+    )
+    assert key.customer_id == "customer-7"
+    assert key.status.value == "paid"
+    assert row == {"customer_id": 7, "status": "paid", "sum__total": 10}
+    null_key = builder.shape_group_key(
+        built.group_key_type, {"customer_id": None}, [("customer", None)],
+        value_encoders={"customer": encode},
+    )
+    assert null_key.customer_id is None
+    assert calls == [7]
+    with pytest.raises(ValueError, match="unbucketed"):
+        builder.shape_group_key(
+            built.group_key_type, {},
+            [("created_at", TimeGranularity.MONTH)],
+            value_encoders={"created_at": str},
+        )

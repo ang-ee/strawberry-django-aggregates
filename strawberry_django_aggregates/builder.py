@@ -1560,6 +1560,7 @@ class AggregateBuilder:
         row: dict[str, Any],
         spec: list[tuple[str, Any]],
         week_start: int = 1,
+        value_encoders: Mapping[str, Callable[[Any], Any]] | None = None,
     ) -> dict[str, Any]:
         """Map one ``compute_aggregation`` row's group-by aliases to the
         ``<Model>GroupKey`` constructor kwargs.
@@ -1582,6 +1583,15 @@ class AggregateBuilder:
             # column, so the row value round-trips onto the key.
             field, alias = self._group_axis_field_and_alias(fp, grain)
             value = row.get(alias)
+            encoder = (value_encoders or {}).get(fp)
+            if encoder is not None:
+                if grain is not None:
+                    raise ValueError(
+                        f"Group-key encoder for {fp!r} requires "
+                        "an unbucketed axis"
+                    )
+                if value is not None:
+                    value = encoder(value)
             # A ``choices``-backed group-by column is typed as a GraphQL
             # enum on ``<Model>GroupKey`` (see ``types._choices_enum_for``);
             # the compiler row carries the raw stored value, so coerce it
@@ -1643,6 +1653,7 @@ class AggregateBuilder:
         spec: list[tuple[str, Any]],
         *,
         week_start: int = 1,
+        value_encoders: Mapping[str, Callable[[Any], Any]] | None = None,
     ) -> Any:
         """Shape one ``compute_aggregation`` row into a typed
         ``<Model>GroupKey`` instance.
@@ -1656,6 +1667,12 @@ class AggregateBuilder:
         :func:`shape_aggregate_row` fills the aggregate. ``spec`` is the
         same ``[(field_path, granularity), …]`` list passed to
         :func:`compute_aggregation`.
+
+        ``value_encoders`` maps declared field paths (not SQL aliases) to
+        output codecs. They transform non-null, unbucketed key values only;
+        they must preserve the key's GraphQL scalar and identity. The input
+        row, aggregate measures, grouping SQL and cardinality are unchanged.
+        Nulls bypass the codec. Encoding a bucketed axis raises ``ValueError``.
 
         Note the asymmetry when JSON-path measures (SPEC § 6.1) are in
         play: this method sources the JSON-path allowlist from the builder
@@ -1673,7 +1690,9 @@ class AggregateBuilder:
         :attr:`BuiltAggregates.json_paths` for exactly this re-emission.
         """
         return group_key_type(
-            **self._build_group_key_kwargs(row, spec, week_start)
+            **self._build_group_key_kwargs(
+                row, spec, week_start, value_encoders
+            )
         )
 
     def _shape_grouped(

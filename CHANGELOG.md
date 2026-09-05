@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.0.dev0 (unreleased)
+
+- AggregateBuilder.shape_group_key accepts optional output-only value_encoders
+  keyed by declared group paths. Nulls, source rows and aggregate values remain
+  unchanged; bucketed axes reject incompatible codecs.
+
+
 All notable changes to `strawberry-django-aggregates` are documented here.
 The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see

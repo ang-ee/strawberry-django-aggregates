@@ -1493,3 +1493,15 @@ The streaming generator is deterministic given a stable queryset: same inputs â‡
 ---
 
 **Implementation phasing.** Phase 1: `compute_aggregation` + tests (~1 week). Phase 2: type generators (`make_*`) + tests (~1 week). Phase 3: `AggregateBuilder` convenience + integration tests against a real Strawberry schema (~3 days). Total ~2.5 weeks for a clean v0.1.0.
+
+
+## Public group-key output codecs
+
+AggregateBuilder.shape_group_key(..., value_encoders={path: encode}) can
+translate non-null, unbucketed key values for a consumer's public identity.
+The mapping is keyed by declared field paths, including nested relation paths,
+not SQL aliases. Codecs must preserve the generated scalar type and identity.
+They never mutate the compiler row or change grouping, measures, ordering or
+cardinality. Null keys bypass the codec; configuring a codec for a selected
+date/number bucket raises ValueError. Choices enum coercion and native time
+bucket ranges continue to belong to the builder.
