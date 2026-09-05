@@ -16,7 +16,7 @@ modules only — never from ``strawberry`` or ``strawberry_django``.
 from __future__ import annotations
 
 import datetime
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any, overload
 from zoneinfo import ZoneInfo
 
@@ -48,6 +48,7 @@ from django.db.models import (
     Value,
     Variance,
 )
+from django.db.models.expressions import Combinable
 from django.db.models.functions import Cast, Coalesce, Concat, Extract, Trunc
 from django.db.models.functions.datetime import TimezoneMixin
 
@@ -382,6 +383,7 @@ def compute_aggregation(
     fill_max:   datetime.datetime | None = ...,
     allow_relation_traversal: bool = ...,
     json_paths: dict[str, str] | None = ...,
+    group_by_expressions: Mapping[str, Combinable] | None = ...,
     chunk_size: None = ...,
 ) -> list[dict[str, Any]]: ...
 
@@ -405,6 +407,7 @@ def compute_aggregation(
     fill_max:   datetime.datetime | None = ...,
     allow_relation_traversal: bool = ...,
     json_paths: dict[str, str] | None = ...,
+    group_by_expressions: Mapping[str, Combinable] | None = ...,
     chunk_size: int = ...,
 ) -> Iterator[list[dict[str, Any]]]: ...
 
@@ -427,6 +430,7 @@ def compute_aggregation(
     fill_max:   datetime.datetime | None = None,
     allow_relation_traversal: bool = False,
     json_paths: dict[str, str] | None = None,
+    group_by_expressions: Mapping[str, Combinable] | None = None,
     chunk_size: int | None = None,
 ) -> list[dict[str, Any]] | Iterator[list[dict[str, Any]]]:
     """Compile a queryset into an aggregation query.
@@ -486,6 +490,15 @@ def compute_aggregation(
     - This flag lives on the backend primitive only. ``AggregateBuilder``
       / GraphQL surface does NOT expose it (CLAUDE.md Critical Rule 9 +
       Rule 4 separation).
+
+    ``group_by_expressions`` replaces the value expression for selected
+    to-one scalar axes while preserving their declared logical
+    paths and canonical result aliases. The compiler still resolves every
+    selected path against the model, validates relation cardinality and
+    granularity, and owns grouping, ordering and result shape. Mapping keys
+    must be selected to-one paths; direct fields and JSON paths fail loud
+    because their canonical aliases are already concrete or synthetic
+    projection owners.
 
     ``fill`` enables empty-bucket filling (SPEC § 7.2). When ``True``,
     ``group_by`` MUST contain exactly one ``TimeGranularity`` entry —
@@ -575,6 +588,7 @@ def compute_aggregation(
 
     group_annotations, group_aliases = _build_group_by_annotations(
         model, group_by, tzinfo, week_start, json_paths,
+        group_by_expressions,
     )
 
     aggregate_annotations = _build_aggregate_annotations(
@@ -1411,6 +1425,7 @@ def _build_group_by_annotations(
     tzinfo: ZoneInfo,
     week_start: int = 1,
     json_paths: dict[str, str] | None = None,
+    group_by_expressions: Mapping[str, Combinable] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Build the ``.annotate()`` kwargs that materialize each group_by
     spec, plus the canonical alias list to feed into ``.values()``.
@@ -1429,10 +1444,25 @@ def _build_group_by_annotations(
     """
     annotations: dict[str, Any] = {}
     aliases:     list[str]      = []
+    expressions = group_by_expressions or {}
+    selected_group_paths = {field_path for field_path, _ in group_by}
+    if unknown_expressions := sorted(set(expressions) - selected_group_paths):
+        raise GroupByFieldNotAllowed(
+            "group_by_expressions contains unselected field path(s): "
+            f"{unknown_expressions!r}. Every override must match a selected "
+            "group_by field path."
+        )
 
     for field_path, granularity in group_by:
+        has_override = field_path in expressions
         json = _resolve_json_path(model, field_path, json_paths)
         if json is not None:
+            if has_override:
+                raise GroupByFieldNotAllowed(
+                    "group_by_expressions supports to-one field "
+                    f"paths; JSON path `{field_path}` owns its native cast "
+                    "expression."
+                )
             alias, declared_type, expression = json
             if granularity is not None:
                 if declared_type not in {"date", "datetime"}:
@@ -1443,9 +1473,18 @@ def _build_group_by_annotations(
                         f"meaningful on `date` / `datetime` paths.",
                     )
                 bucket_alias = group_by_alias(alias, granularity)
-                annotations[bucket_alias] = _build_json_group_by_expression(
-                    expression, granularity, declared_type,
-                    tzinfo, week_start,
+                temporal_field: Any = (
+                    DateTimeField()
+                    if declared_type == "datetime"
+                    else DateField()
+                )
+                annotations[bucket_alias] = _build_group_by_expression(
+                    field_path,
+                    granularity,
+                    temporal_field,
+                    tzinfo,
+                    week_start,
+                    source_expression=expression,
                 )
                 aliases.append(bucket_alias)
             else:
@@ -1462,7 +1501,18 @@ def _build_group_by_annotations(
                 f"`{model.__name__}` — would row-multiply."
             )
         alias = group_by_alias(field_path, granularity, field)
-        if granularity is not None:
+        if has_override:
+            if "__" not in field_path or getattr(field, "is_relation", False):
+                raise GroupByFieldNotAllowed(
+                    "group_by_expressions supports to-one scalar or "
+                    f"date paths; `{field_path}` is a direct or relationship "
+                    "key."
+                )
+            annotations[alias] = _build_group_by_expression(
+                field_path, granularity, field, tzinfo, week_start,
+                source_expression=expressions[field_path],
+            )
+        elif granularity is not None:
             annotations[alias] = _build_group_by_expression(
                 field_path, granularity, field, tzinfo, week_start,
             )
@@ -1471,71 +1521,14 @@ def _build_group_by_annotations(
     return annotations, aliases
 
 
-def _build_json_group_by_expression(
-    base_expression: Any,
-    granularity: Granularity,
-    declared_type: str,
-    tzinfo: ZoneInfo,
-    week_start: int = 1,
-) -> Any:
-    """Build the bucketed expression for a date-typed JSON-path group_by.
-
-    ``base_expression`` is the ``Cast(KeyTextTransform(...))`` wrap
-    produced by :func:`_build_json_path_expression`. We layer
-    ``Trunc`` / ``Extract`` on top of it the same way the Field-based
-    path does in :func:`_build_group_by_expression`.
-
-    The ``tzinfo`` keyword is passed only for ``datetime`` — ``date``
-    is timezone-naive by definition and Django's ``Trunc`` / ``Extract``
-    raise on ``tzinfo`` against a date-typed expression.
-    """
-    is_dt = declared_type == "datetime"
-    tz_kw: dict[str, Any] = {"tzinfo": tzinfo} if is_dt else {}
-
-    if isinstance(granularity, TimeGranularity):
-        if granularity is TimeGranularity.WEEK:
-            offset = (8 - week_start) % 7
-            if offset == 0:
-                return Trunc(base_expression, "week", **tz_kw)
-            delta = datetime.timedelta(days=offset)
-            out_field: Any = (
-                DateTimeField() if is_dt else DateField()
-            )
-            shifted_in = ExpressionWrapper(
-                base_expression + delta, output_field=out_field,
-            )
-            truncated = Trunc(shifted_in, "week", **tz_kw)
-            return ExpressionWrapper(
-                truncated - delta, output_field=out_field,
-            )
-        return Trunc(base_expression, granularity.value, **tz_kw)
-
-    if isinstance(granularity, NumberGranularity):
-        if granularity is NumberGranularity.DAY_OF_YEAR:
-            return _ExtractDayOfYear(base_expression, **tz_kw)
-        if granularity is NumberGranularity.DAY_OF_WEEK:
-            base = Extract(base_expression, "iso_week_day", **tz_kw)
-            if week_start == 1:
-                return base
-            return ExpressionWrapper(
-                ((base - Value(week_start) + Value(7)) % Value(7)) + Value(1),
-                output_field=IntegerField(),
-            )
-        return Extract(
-            base_expression, _NUMBER_LOOKUP[granularity], **tz_kw,
-        )
-
-    raise GranularityNotApplicable(  # defensive
-        f"Unknown granularity {granularity!r}.",
-    )
-
-
 def _build_group_by_expression(
     field_path: str,
     granularity: Granularity | None,
     field: Field,
     tzinfo: ZoneInfo,
     week_start: int = 1,
+    *,
+    source_expression: Any | None = None,
 ) -> Any:
     """Build the Django expression for a group_by spec.
 
@@ -1550,8 +1543,13 @@ def _build_group_by_expression(
     ``odoo/models.py:2142-2168``. Default ``1`` is ISO (Mon) and emits
     the same SQL as before this stream — no behaviour change.
     """
+    source = (
+        source_expression
+        if source_expression is not None
+        else F(field_path)
+    )
     if granularity is None:
-        return F(field_path)
+        return source
 
     if not isinstance(field, (DateField, DateTimeField, TimeField)):
         raise GranularityNotApplicable(
@@ -1568,18 +1566,18 @@ def _build_group_by_expression(
     if isinstance(granularity, TimeGranularity):
         if granularity is TimeGranularity.WEEK:
             return _trunc_week_shifted(
-                field_path, field, tz_kw, week_start,
+                source, field, tz_kw, week_start,
             )
-        return Trunc(field_path, granularity.value, **tz_kw)
+        return Trunc(source, granularity.value, **tz_kw)
 
     if isinstance(granularity, NumberGranularity):
         if granularity is NumberGranularity.DAY_OF_YEAR:
-            return _ExtractDayOfYear(field_path, **tz_kw)
+            return _ExtractDayOfYear(source, **tz_kw)
         if granularity is NumberGranularity.DAY_OF_WEEK:
             return _extract_day_of_week_rotated(
-                field_path, tz_kw, week_start,
+                source, tz_kw, week_start,
             )
-        return Extract(field_path, _NUMBER_LOOKUP[granularity], **tz_kw)
+        return Extract(source, _NUMBER_LOOKUP[granularity], **tz_kw)
 
     raise GranularityNotApplicable(  # defensive
         f"Unknown granularity {granularity!r}."
@@ -1587,7 +1585,7 @@ def _build_group_by_expression(
 
 
 def _trunc_week_shifted(
-    field_path: str,
+    source_expression: Any,
     field: Field,
     tz_kw: dict[str, Any],
     week_start: int,
@@ -1606,14 +1604,14 @@ def _trunc_week_shifted(
     """
     offset = (8 - week_start) % 7
     if offset == 0:
-        return Trunc(field_path, "week", **tz_kw)
+        return Trunc(source_expression, "week", **tz_kw)
 
     delta = datetime.timedelta(days=offset)
     out_field: Any = (
         DateTimeField() if isinstance(field, DateTimeField) else DateField()
     )
     shifted_in = ExpressionWrapper(
-        F(field_path) + delta, output_field=out_field,
+        source_expression + delta, output_field=out_field,
     )
     truncated = Trunc(shifted_in, "week", **tz_kw)
     return ExpressionWrapper(
@@ -1622,7 +1620,7 @@ def _trunc_week_shifted(
 
 
 def _extract_day_of_week_rotated(
-    field_path: str,
+    source_expression: Any,
     tz_kw: dict[str, Any],
     week_start: int,
 ) -> Any:
@@ -1637,7 +1635,7 @@ def _extract_day_of_week_rotated(
     (``((d - 1) % 7) + 1 == d``) — skip the arithmetic so the SQL is
     identical to the pre-stream-6 ISO emission.
     """
-    base = Extract(field_path, "iso_week_day", **tz_kw)
+    base = Extract(source_expression, "iso_week_day", **tz_kw)
     if week_start == 1:
         return base
     # ``%`` in Django expressions follows Python semantics on PG

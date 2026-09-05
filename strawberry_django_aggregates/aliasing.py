@@ -17,7 +17,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from strawberry_django_aggregates.granularity import Granularity
+from strawberry_django_aggregates.granularity import (
+    Granularity,
+    TimeGranularity,
+)
 
 if TYPE_CHECKING:
     from django.db.models.fields import Field
@@ -37,6 +40,11 @@ def json_path_alias(field_path: str) -> str:
     ``.values``.
     """
     return field_path.replace(".", "__")
+
+
+def group_by_enum_member(field_path: str) -> str:
+    """Canonical enum member for a declared group-by field path."""
+    return json_path_alias(field_path).upper()
 
 
 def group_by_alias(
@@ -76,3 +84,15 @@ def group_by_alias(
             and getattr(field, "many_to_one", False):
         return f"{base}_id"
     return base
+
+
+def group_by_range_alias(
+    field_path: str,
+    granularity: TimeGranularity,
+) -> str:
+    """Canonical sibling alias for a temporal bucket's half-open range."""
+    if not isinstance(granularity, TimeGranularity):
+        raise ValueError(
+            "group_by_range_alias requires a TimeGranularity value."
+        )
+    return f"{group_by_alias(field_path, granularity)}_range"

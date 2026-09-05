@@ -5,6 +5,23 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.12.0] — 2026-09-06
+
+### Added
+
+- **Caller-owned expressions for selected to-one group axes.**
+  `compute_aggregation(..., group_by_expressions=...)` and
+  `AggregateBuilder.count_groups(..., group_by_expressions=...)` now accept
+  the same mapping of logical paths to Django expressions. The compiler keeps
+  native validation, aliases, date truncation, grouping, HAVING, ordering,
+  paging, result shape, and exact counts. Direct, JSON, relationship-key,
+  to-many, and unselected axes fail loud.
+- **Public canonical naming and JSON-token helpers.**
+  `group_by_enum_member`, `group_by_range_alias`, and
+  `python_type_for_json` let metadata and schema adapters reuse the native
+  group naming and seven-token JSON type vocabulary. Unsupported JSON tokens
+  now fail at declaration time instead of falling back to `str`.
+
 ## [0.11.0] — 2026-09-05
 
 ### Added

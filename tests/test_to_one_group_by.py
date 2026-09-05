@@ -13,14 +13,18 @@ annotations on the ``Query`` class become strings Strawberry cannot
 evaluate.
 """
 
+import datetime
+
 import pytest
 import strawberry
 import strawberry_django
+from django.db import models
 
 from strawberry_django_aggregates import (
     AggregateBuilder,
     AggregateOp,
     FilterEchoError,
+    TimeGranularity,
     compute_aggregation,
 )
 from strawberry_django_aggregates.errors import (
@@ -297,6 +301,169 @@ def test_non_relation_middle_segment_fails_loud(db):
             group_by=[("total__foo", None)],
             aggregates=[(AggregateOp.COUNT, None)],
         )
+
+
+# ---------------------------------------------------------------------------
+# caller-owned group expressions preserve the declared key contract
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_group_by_expression_replaces_only_the_selected_axis(sample_orders):
+    """A policy expression can redact a label without merging identities."""
+    customers, _orders = sample_orders
+    alpha, beta, gamma = customers
+    safe_name = models.Case(
+        models.When(
+            customer_id__in=[alpha.pk],
+            then=models.F("customer__name"),
+        ),
+        default=models.Value(None),
+        output_field=models.CharField(),
+    )
+
+    rows = compute_aggregation(
+        Order.objects.all(),
+        group_by=[("customer", None), ("customer__name", None)],
+        aggregates=[(AggregateOp.COUNT, None)],
+        order_by=[("customer_id", "asc", None)],
+        group_by_expressions={"customer__name": safe_name},
+    )
+
+    assert rows == [
+        {
+            "customer_id": alpha.pk,
+            "customer__name": "Alpha",
+            "count": 3,
+        },
+        {
+            "customer_id": beta.pk,
+            "customer__name": None,
+            "count": 2,
+        },
+        {
+            "customer_id": gamma.pk,
+            "customer__name": None,
+            "count": 1,
+        },
+    ]
+
+
+@pytest.mark.django_db
+def test_group_by_expression_rejects_an_unselected_path(sample_orders):
+    """Overrides cannot bypass the selected logical group contract."""
+    with pytest.raises(GroupByFieldNotAllowed, match="unselected"):
+        compute_aggregation(
+            Order.objects.all(),
+            group_by=[("status", None)],
+            aggregates=[(AggregateOp.COUNT, None)],
+            group_by_expressions={"customer__name": models.Value(None)},
+        )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("group_by", "json_paths"),
+    [
+        ([('status', None)], None),
+        ([('metadata.region', None)], {"metadata.region": "str"}),
+        ([('order__customer', None)], None),
+    ],
+)
+def test_group_by_expression_rejects_non_scalar_to_one_axes(
+    sample_order_items, group_by, json_paths
+):
+    """Direct and JSON axes retain their native projection owners."""
+    with pytest.raises(GroupByFieldNotAllowed, match="to-one"):
+        compute_aggregation(
+            (
+                OrderItem.objects.all()
+                if group_by[0][0].startswith("order__")
+                else Order.objects.all()
+            ),
+            group_by=group_by,
+            aggregates=[(AggregateOp.COUNT, None)],
+            json_paths=json_paths,
+            group_by_expressions={group_by[0][0]: models.Value(None)},
+        )
+
+
+@pytest.mark.django_db
+def test_count_groups_uses_the_same_group_by_expression(sample_orders):
+    """Exact cardinality and HAVING share policy-aware grouped keys."""
+    customers, _orders = sample_orders
+    alpha = customers[0]
+    safe_name = models.Case(
+        models.When(
+            customer_id=alpha.pk,
+            then=models.F("customer__name"),
+        ),
+        default=models.Value(None),
+        output_field=models.CharField(),
+    )
+    builder = AggregateBuilder(
+        model=Order,
+        aggregate_fields=["total"],
+        group_by_fields=["customer__name"],
+    )
+
+    assert builder.count_groups(
+        Order.objects.all(),
+        [("customer__name", None)],
+        [(AggregateOp.COUNT, None)],
+        {},
+        group_by_expressions={"customer__name": safe_name},
+    ) == 2
+    assert builder.count_groups(
+        Order.objects.all(),
+        [("customer__name", None)],
+        [(AggregateOp.COUNT, None)],
+        {"count__gt": 2},
+        group_by_expressions={"customer__name": safe_name},
+    ) == 2
+
+
+@pytest.mark.django_db
+def test_group_by_date_expression_is_wrapped_before_week_truncation(db):
+    """The override source still receives timezone and week-start rules."""
+    joined_at = datetime.datetime(
+        2026, 5, 2, 23, 30, tzinfo=datetime.UTC
+    )
+    customer = Customer.objects.create(
+        name="Tokyo week", joined_at=joined_at
+    )
+    Order.objects.create(
+        customer=customer,
+        status="paid",
+        total=1,
+        created_at=joined_at,
+    )
+    shifted_source = models.ExpressionWrapper(
+        models.F("customer__joined_at") - datetime.timedelta(days=1),
+        output_field=models.DateTimeField(),
+    )
+
+    native = compute_aggregation(
+        Order.objects.filter(customer=customer),
+        group_by=[("customer__joined_at", TimeGranularity.WEEK)],
+        aggregates=[(AggregateOp.COUNT, None)],
+        tz="Asia/Tokyo",
+        week_start=7,
+    )
+    overridden = compute_aggregation(
+        Order.objects.filter(customer=customer),
+        group_by=[("customer__joined_at", TimeGranularity.WEEK)],
+        aggregates=[(AggregateOp.COUNT, None)],
+        tz="Asia/Tokyo",
+        week_start=7,
+        group_by_expressions={"customer__joined_at": shifted_source},
+    )
+
+    assert native[0]["customer__joined_at_week"].date() == datetime.date(
+        2026, 5, 3
+    )
+    assert overridden[0]["customer__joined_at_week"].date() == datetime.date(
+        2026, 4, 26
+    )
 
 
 # ---------------------------------------------------------------------------

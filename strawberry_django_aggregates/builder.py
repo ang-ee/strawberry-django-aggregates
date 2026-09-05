@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import strawberry
 import strawberry_django
+from django.db.models.expressions import Combinable
 from strawberry_django.filters import apply as apply_filters
 from strawberry_django.pagination import (
     OffsetPaginationInfo,
@@ -33,7 +34,10 @@ from strawberry_django.pagination import (
 )
 from strawberry_django.settings import strawberry_django_settings
 
-from strawberry_django_aggregates.aliasing import group_by_alias
+from strawberry_django_aggregates.aliasing import (
+    group_by_alias,
+    group_by_range_alias,
+)
 from strawberry_django_aggregates.compiler import (
     HAVING_COMPARISONS,
     bucket_range,
@@ -1473,6 +1477,7 @@ class AggregateBuilder:
         op_args: dict[str, dict[str, Any]] | None = None,
         week_start: int = 1,
         tz: str | None = None,
+        group_by_expressions: Mapping[str, Combinable] | None = None,
     ) -> int:
         """Return the exact database-side group cardinality before paging.
 
@@ -1495,6 +1500,10 @@ class AggregateBuilder:
         COUNT groups by the same temporal boundaries the data query uses.
         Counting with different temporal settings could report a different
         bucket cardinality than the page returns.
+
+        ``group_by_expressions`` has the same logical-path contract as
+        :func:`compute_aggregation`, ensuring a custom grouped envelope uses
+        identical policy-aware keys for rows and exact cardinality.
         """
         from django.conf import settings
         from django.db import connections
@@ -1515,6 +1524,12 @@ class AggregateBuilder:
                 "filter on the queryset directly with `.filter(...)`."
             )
         if not spec:
+            if group_by_expressions:
+                raise GroupByFieldNotAllowed(
+                    "group_by_expressions contains unselected field path(s): "
+                    f"{sorted(group_by_expressions)!r}. Every override must "
+                    "match a selected group_by field path."
+                )
             return 1
 
         vendor = connections[qs.db].vendor
@@ -1522,6 +1537,7 @@ class AggregateBuilder:
         tzinfo = _resolve_tzinfo(tz or settings.TIME_ZONE)
         group_ann, group_aliases = _build_group_by_annotations(
             qs.model, spec, tzinfo, week_start, self.json_paths,
+            group_by_expressions,
         )
 
         if not having_dict:
@@ -1641,9 +1657,8 @@ class AggregateBuilder:
             # that case the range stays None too.
             if isinstance(grain, TimeGranularity) and value is not None:
                 from_, to = bucket_range(value, grain, week_start)
-                key_kwargs[f"{alias}_range"] = BucketRange(
-                    from_=from_, to=to,
-                )
+                range_alias = group_by_range_alias(fp, grain)
+                key_kwargs[range_alias] = BucketRange(from_=from_, to=to)
         return key_kwargs
 
     def shape_group_key(
@@ -1823,7 +1838,9 @@ class AggregateBuilder:
             # Reuse the half-open [from, to) interval the key shaping
             # already computed — do NOT recompute it. Emit gte/lt, never
             # strawberry-django's inclusive `range` lookup.
-            range_value = key_kwargs.get(f"{alias}_range")
+            range_value = key_kwargs.get(
+                group_by_range_alias(fp, grain)
+            )
             if range_value is None:
                 raise FilterEchoError(
                     f"Grouped bucket {fp!r} has no BucketRange for "

@@ -38,12 +38,17 @@ import strawberry.federation
 from strawberry.scalars import JSON
 from strawberry_django.pagination import OffsetPaginationInfo
 
-from strawberry_django_aggregates.aliasing import group_by_alias
+from strawberry_django_aggregates.aliasing import (
+    group_by_alias,
+    group_by_enum_member,
+    group_by_range_alias,
+)
 from strawberry_django_aggregates.compiler import resolve_field_to_one_only
 from strawberry_django_aggregates.errors import (
     ChoicesEnumCollisionError,
     ChoicesEnumNameError,
     GroupByFieldNotAllowed,
+    JSONPathNotAllowed,
 )
 from strawberry_django_aggregates.granularity import (
     NumberGranularity,
@@ -250,7 +255,7 @@ _INTEGRAL_TYPES: frozenset[str] = frozenset({
 
 
 # Wire-token → Python type for declared JSON-path types (SPEC § 6.1).
-_JSON_DECLARED_TO_PY: dict[str, Any] = {
+_JSON_DECLARED_TO_PY: dict[str, type[Any]] = {
     "str":      str,
     "int":      int,
     "float":    float,
@@ -261,7 +266,7 @@ _JSON_DECLARED_TO_PY: dict[str, Any] = {
 }
 
 
-def _natural_python_type_for_json(declared_type: str) -> Any:
+def python_type_for_json(declared_type: str) -> type[Any]:
     """Map a declared-JSON-path type token to its Python output type.
 
     Mirrors :func:`_natural_python_type` but operates on the SPEC § 6.1
@@ -269,10 +274,16 @@ def _natural_python_type_for_json(declared_type: str) -> Any:
     :func:`_aggregate_python_type` for JSON-path measures and by
     :func:`_emit_group_key` for JSON-path group keys.
 
-    Unknown tokens fall through to ``str`` — same defensive default as
-    the Field-based helper.
+    Unknown tokens fail loud at declaration time. The same seven-token
+    vocabulary drives emitted GraphQL types and compiler casts.
     """
-    return _JSON_DECLARED_TO_PY.get(declared_type, str)
+    try:
+        return _JSON_DECLARED_TO_PY[declared_type]
+    except KeyError as exc:
+        raise JSONPathNotAllowed(
+            f"Unknown declared JSON type {declared_type!r}; expected one of "
+            f"{sorted(_JSON_DECLARED_TO_PY)!r}."
+        ) from exc
 
 
 def _natural_python_type(field: Field) -> Any:
@@ -539,7 +550,7 @@ def _aggregate_python_type_for_json(
     Field-based path.
     """
     if op in {AggregateOp.MIN, AggregateOp.MAX}:
-        return _natural_python_type_for_json(declared_type)
+        return python_type_for_json(declared_type)
     if op is AggregateOp.SUM:
         if declared_type == "Decimal":
             return decimal.Decimal
@@ -547,7 +558,7 @@ def _aggregate_python_type_for_json(
             return float
         if declared_type == "int":
             return BigInt
-        return _natural_python_type_for_json(declared_type)
+        return python_type_for_json(declared_type)
     if op is AggregateOp.AVG:
         if declared_type == "Decimal":
             return decimal.Decimal
@@ -562,11 +573,11 @@ def _aggregate_python_type_for_json(
     if op in {AggregateOp.PERCENTILE_CONT, AggregateOp.PERCENTILE_DISC}:
         return float
     if op is AggregateOp.MODE:
-        return _natural_python_type_for_json(declared_type)
+        return python_type_for_json(declared_type)
     if op in {AggregateOp.BOOL_AND, AggregateOp.BOOL_OR}:
         return bool
     if op is AggregateOp.ARRAY_AGG:
-        item_type = _natural_python_type_for_json(declared_type)
+        item_type = python_type_for_json(declared_type)
         return list[item_type]  # type: ignore[misc,valid-type]
     if op is AggregateOp.STRING_AGG:
         return str
@@ -576,6 +587,12 @@ def _aggregate_python_type_for_json(
 # ---------------------------------------------------------------------------
 # Allowlist resolution
 # ---------------------------------------------------------------------------
+
+def _validate_json_paths(json_paths: dict[str, str] | None) -> None:
+    """Validate every declared JSON token through the public owner."""
+    for declared_type in (json_paths or {}).values():
+        python_type_for_json(declared_type)
+
 
 def _resolve_aggregate_fields(
     model: type[Model],
@@ -591,6 +608,7 @@ def _resolve_aggregate_fields(
     field-name strings as supplied (dotted for JSON paths) so
     downstream consumers can detect JSON entries via ``.`` membership.
     """
+    _validate_json_paths(json_paths)
     if aggregate_fields is not None:
         return list(aggregate_fields)
     eligible: list[str] = []
@@ -627,6 +645,7 @@ def _resolve_group_by_fields(
     ``json_paths`` are appended in sorted order when no explicit
     ``group_by_fields`` list was supplied.
     """
+    _validate_json_paths(json_paths)
     if group_by_fields is not None:
         return list(group_by_fields)
     eligible: list[str] = []
@@ -1160,7 +1179,7 @@ def _emit_group_key(
             # the per-granularity suffix (SPEC § 16) so these key names
             # cannot drift from the resolver's emitted aliases.
             alias_name = group_by_alias(field_name, None)
-            py_type = _natural_python_type_for_json(declared_type)
+            py_type = python_type_for_json(declared_type)
             key_fields.append((alias_name, (py_type | None), None))
             if declared_type in {"date", "datetime"}:
                 for time_grain in TimeGranularity:
@@ -1171,7 +1190,7 @@ def _emit_group_key(
                         None,
                     ))
                     key_fields.append((
-                        f"{bucket}_range",
+                        group_by_range_alias(field_name, time_grain),
                         (BucketRange | None),
                         None,
                     ))
@@ -1229,7 +1248,7 @@ def _emit_group_key(
                     None,
                 ))
                 key_fields.append((
-                    f"{bucket}_range",
+                    group_by_range_alias(field_name, time_grain),
                     (BucketRange | None),
                     None,
                 ))
@@ -1370,7 +1389,7 @@ def make_group_by_spec(
     )
 
     members = [
-        (field_name.replace(".", "__").upper(),
+        (group_by_enum_member(field_name),
          field_name.replace(".", "__"))
         for field_name in g_fields
     ]

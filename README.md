@@ -74,6 +74,11 @@ type OrderGrouped {
 - **HAVING with aggregate aliases.** `{ countGt: 5, sumTotalGt: 1000 }` — typed inputs generated per measure.
 - **Ordering on aggregates.** `[{ field: "total:sum", direction: DESC }]` — fail-loud on unknown terms (Odoo's pre-17 silent-drop bug avoided).
 - **Standalone backend primitive.** `compute_aggregation(qs, group_by, aggregates, having, order_by, ...)` is callable from any Python context — DRF view, Celery task, admin script, MCP tool — not just GraphQL resolvers.
+- **Composable group-key projection.** A custom grouped envelope can pass the
+  same `group_by_expressions` mapping to `compute_aggregation` and
+  `AggregateBuilder.count_groups` for selected to-one scalar/date
+  axes. Native aliases, temporal bucketing, HAVING, rows, and exact counts stay
+  aligned; unsupported axes fail loud.
 - **Exact group cardinality.** `AggregateBuilder.count_groups(...)` returns the database-side group count before pagination for custom grouped envelopes, including filters, granularity, JSON paths, and `HAVING`.
 - **Determinism.** Type generation produces byte-identical SDL for the same inputs.
 - **No magic.** Every operator, every granularity, every type is whitelisted.
