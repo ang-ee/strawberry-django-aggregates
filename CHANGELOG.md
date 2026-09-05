@@ -1,16 +1,20 @@
 # Changelog
 
-## 0.11.0.dev0 (unreleased)
-
-- AggregateBuilder.shape_group_key accepts optional output-only value_encoders
-  keyed by declared group paths. Nulls, source rows and aggregate values remain
-  unchanged; bucketed axes reject incompatible codecs.
-
-
 All notable changes to `strawberry-django-aggregates` are documented here.
 The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
+
+## [0.11.0] — 2026-09-05
+
+### Added
+
+- **Public group-key output codecs.**
+  `AggregateBuilder.shape_group_key(..., value_encoders={path: encode})`
+  accepts optional output-only codecs keyed by declared group paths. Nulls,
+  source rows, aggregate values, grouping, ordering, and cardinality remain
+  unchanged. Bucketed axes reject incompatible codecs. Omitting codecs
+  preserves existing behavior.
 
 ## [0.10.0] — 2026-07-15
 
