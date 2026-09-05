@@ -10,6 +10,7 @@ import pytest
 from strawberry_django_aggregates import AggregateBuilder, AggregateOp
 from strawberry_django_aggregates.errors import (
     AggregateError,
+    GroupByFieldNotAllowed,
     OperatorNotSupportedError,
 )
 
@@ -163,4 +164,38 @@ def test_count_groups_rejects_having_without_groups(
             [],
             [(AggregateOp.COUNT, None)],
             {"count__gt": 0},
+        )
+
+
+@pytest.mark.django_db
+def test_count_groups_rejects_an_unselected_expression(
+    sample_orders, order_builder
+):
+    from django.db import models
+
+    from tests.models import Order
+
+    with pytest.raises(GroupByFieldNotAllowed, match="unselected"):
+        order_builder.count_groups(
+            Order.objects.all(),
+            [("status", None)],
+            [(AggregateOp.COUNT, None)],
+            {},
+            group_by_expressions={"customer__name": models.Value(None)},
+        )
+
+
+@pytest.mark.django_db
+def test_count_groups_rejects_expressions_without_grouping(order_builder):
+    from django.db import models
+
+    from tests.models import Order
+
+    with pytest.raises(GroupByFieldNotAllowed, match="unselected"):
+        order_builder.count_groups(
+            Order.objects.all(),
+            [],
+            [(AggregateOp.COUNT, None)],
+            {},
+            group_by_expressions={"customer__name": models.Value(None)},
         )

@@ -880,6 +880,25 @@ leaf field and refusing to-many segments. It is consumed by the compiler
 from the same walk. Direction is `types.py` / `builder.py` → `compiler.py`
 (allowed; Critical Rule 9 only forbids the reverse).
 
+**Caller-owned value expressions.** `compute_aggregation(...,
+group_by_expressions={path: expression})` lets a composition layer replace
+the SQL value expression for a selected to-one scalar or date leaf
+without replacing the logical axis. `AggregateBuilder.count_groups` accepts
+the same mapping. Both paths apply the override before temporal truncation,
+then reuse the native alias, grouping, ordering, HAVING, pagination, result
+shape, and exact-cardinality machinery. This is intended for request-bound
+policy projections such as `CASE WHEN related_id IN (<readable ids>) THEN
+related.label ELSE NULL END`; the core remains permission-naive and never
+derives an actor itself.
+
+Every mapping key must also occur in the translated `group_by` spec. Direct
+model fields, JSON paths, and relationship-key leaves reject overrides with
+`GroupByFieldNotAllowed`; those axes already have concrete or synthetic
+projection owners. To-many paths retain the normal refusal. This narrow
+contract prevents callers from creating undeclared keys or silently
+shadowing a concrete model column. Grouped rows and `count_groups` must receive
+the same mapping whenever exact cardinality is exposed.
+
 **Versioning.** New groupable-field enum members + new `<Model>GroupKey`
 fields are **additive** ⇒ **minor** (Critical Rule 10).
 
@@ -1231,7 +1250,7 @@ Returns a flat list of dicts. Group-by keys live alongside aggregate aliases on 
 
 **Public row-shapers.** A consumer that wants a *custom* grouped envelope (rather than the built `<Model>Grouped`) shapes each row itself with two public helpers: `shape_aggregate_row(aggregate_type, row, requested)` fills the free `<Model>Aggregate`, and `AggregateBuilder.shape_group_key(group_key_type, row, spec, *, week_start=1)` fills the typed `<Model>GroupKey` (choices-enum members, FK `_id`, date buckets, and TIME `<alias>_range` siblings). Pairing them yields a `{ key, aggregate }` shape — e.g. a Hasura/NDC group field — composed entirely from this library, no private internals. One asymmetry to mind when JSON-path measures (§ 6.1) are in play: `shape_group_key` is a method and reads the JSON-path allowlist from the builder automatically, whereas `shape_aggregate_row` is a free function — pass it `json_paths=builder.json_paths` (also carried on `BuiltAggregates.json_paths`) to keep the aggregate side in parity. The matching input-side translators are public too: `AggregateBuilder.translate_group_by` / `translate_having` / `translate_order_by` parse the `<Model>GroupBySpec` / `<Model>Having` / `<Model>GroupOrderBy` inputs into the `group_by` / `having` / `order_by` arguments `compute_aggregation` accepts, so a consumer's resolver never re-implements the spec/granularity/having parsing.
 
-**Public group cardinality.** `AggregateBuilder.count_groups(qs, spec, requested, having_dict, *, op_args=None, week_start=1, tz=None)` returns the exact database-side group cardinality before pagination for a custom grouped envelope. Without `HAVING` it counts distinct group aliases; with `HAVING` it counts the post-aggregate rows. The method shares the builder's JSON-path and temporal grouping configuration, validates the same backend constraints as the row query, and deliberately accepts no ordering, offset, or limit.
+**Public group cardinality.** `AggregateBuilder.count_groups(qs, spec, requested, having_dict, *, op_args=None, week_start=1, tz=None, group_by_expressions=None)` returns the exact database-side group cardinality before pagination for a custom grouped envelope. Without `HAVING` it counts distinct group aliases; with `HAVING` it counts the post-aggregate rows. The method shares the builder's JSON-path and temporal grouping configuration, validates the same backend constraints as the row query, and deliberately accepts no ordering, offset, or limit. A custom grouped envelope passes the same `group_by_expressions` mapping to this method and `compute_aggregation` (§ 6.2), so redacted or otherwise caller-projected keys have identical row and count semantics.
 
 `compute_aggregation` is permission-naive — the queryset must already be scoped by the caller. This is the same separation of concerns the rest of the Django ecosystem uses (managers/querysets do the scoping, query libraries compose).
 
@@ -1372,7 +1391,7 @@ tests/
 
 ## 16 · Versioning
 
-The `AggregateOp` enum, the `compute_aggregation` signature, and the `group_by_alias` output contract (FK → `<field>_id`, granularity → `<field>_<granularity>`, JSON path → `.`→`__` rewrite then any granularity suffix, plain field → passthrough) are part of the SemVer contract — breaking changes bump major. `group_by_alias` is the *enforced* single owner of the group-key alias rule: the type emitter, the resolver, cursor pagination (§ 4.1), the having-echo (§ 4.3), the JSON-path annotation aliases, and the dense-fill spine all route through it — no in-tree site recomputes the `_id` / granularity / `.`→`__` suffixes by hand — so the wire keys cannot drift. Consumers building their own grouped envelope MUST call it rather than recompute these suffixes. The Strawberry types it emits inherit Strawberry's evolution semantics (deprecate fields, never break them in a minor release). The library tracks `strawberry-graphql-django` minor versions; major bumps there may force a major bump here.
+The `AggregateOp` enum, the `compute_aggregation` signature, and the public naming/type helpers are part of the SemVer contract — breaking changes bump major. `group_by_alias` owns the output key (FK → `<field>_id`, granularity → `<field>_<granularity>`, JSON path → `.`→`__` rewrite then any granularity suffix, plain field → passthrough). `group_by_enum_member` and `group_by_range_alias` derive the matching groupable enum member and temporal range sibling. The type emitter, resolver, cursor pagination (§ 4.1), having echo (§ 4.3), JSON-path annotations, and dense-fill spine route through these helpers, so consumers MUST use them instead of rebuilding the spelling. `python_type_for_json` owns the seven declared JSON type tokens from § 6.1 and raises `JSONPathNotAllowed` for an unsupported token; schema and metadata adapters should use it rather than copy the vocabulary. The Strawberry types inherit Strawberry's evolution semantics (deprecate fields, never break them in a minor release). The library tracks `strawberry-graphql-django` minor versions; major bumps there may force a major bump here.
 
 ## 18 · Apollo Federation v2 support
 

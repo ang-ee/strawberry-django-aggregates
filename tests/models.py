@@ -12,8 +12,9 @@ from django.db import models
 
 
 class Customer(models.Model):
-    name   = models.CharField(max_length=100)
-    active = models.BooleanField(default=True)
+    name      = models.CharField(max_length=100)
+    active    = models.BooleanField(default=True)
+    joined_at = models.DateTimeField(null=True)
 
     class Meta:
         app_label = "tests"

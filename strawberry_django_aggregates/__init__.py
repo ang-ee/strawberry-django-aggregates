@@ -30,6 +30,10 @@ Public surface:
   ``<field>_<granularity>``, JSON path → ``.`` → ``__`` rewrite then any
   granularity suffix, plain field → passthrough). The enforced single
   owner of this rule; consumers MUST NOT recompute it.
+- :func:`group_by_enum_member`, :func:`group_by_range_alias` — canonical
+  enum and temporal-range sibling names derived from the same path rule.
+- :func:`python_type_for_json` — resolve the seven declared JSON type
+  tokens and fail loud for unsupported tokens.
 - :data:`BigInt` — string-encoded 64-bit signed integer scalar. Output
   type for ``SUM`` over integer Django fields (Postgres widens to
   ``bigint``; the 32-bit GraphQL ``Int`` would silently overflow).
@@ -59,7 +63,11 @@ See ``docs/SPEC.md`` for the full contract.
 
 from __future__ import annotations
 
-from strawberry_django_aggregates.aliasing import group_by_alias
+from strawberry_django_aggregates.aliasing import (
+    group_by_alias,
+    group_by_enum_member,
+    group_by_range_alias,
+)
 from strawberry_django_aggregates.builder import (
     AggregateBuilder,
     shape_aggregate_row,
@@ -115,9 +123,10 @@ from strawberry_django_aggregates.types import (
     make_grouped_connection_type,
     make_grouped_type,
     make_having_input,
+    python_type_for_json,
 )
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 __all__ = [
     # Builder (high-level)
@@ -142,6 +151,9 @@ __all__ = [
     # rule; consumers MUST NOT recompute (FK -> ``_id``, granularity
     # suffix, JSON ``.`` -> ``__`` rewrite).
     "group_by_alias",
+    "group_by_enum_member",
+    "group_by_range_alias",
+    "python_type_for_json",
     # Custom scalars
     "BigInt",
     # Bucket range — half-open [from, to) interval for TIME-granularity
