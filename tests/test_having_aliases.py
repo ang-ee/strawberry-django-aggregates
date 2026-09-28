@@ -87,3 +87,40 @@ def test_having_unknown_comparison_raises(sample_orders):
             aggregates=[(AggregateOp.COUNT, None)],
             having={"count__between": 1},
         )
+
+
+def test_having_filters_merged_relation_key_groups(relation_key_case):
+    case = relation_key_case
+    rows = compute_aggregation(
+        case["queryset"],
+        group_by=[(case["path"], None)],
+        aggregates=[(AggregateOp.COUNT, None)],
+        group_by_expressions=case["expressions"],
+        having={"count__gt": 2},
+        order_by=[(case["alias"], "asc", "last")],
+    )
+    assert rows == [row for row in case["rows"] if row["count"] > 2]
+
+
+def test_having_sum_uses_all_rows_in_projected_null_group(sample_orders):
+    from django.db import models
+
+    from tests.models import Order
+
+    alpha = sample_orders[0][0]
+    rows = compute_aggregation(
+        Order.objects.all(),
+        group_by=[("customer", None)],
+        aggregates=[(AggregateOp.COUNT, None), (AggregateOp.SUM, "total")],
+        group_by_expressions={
+            "customer": models.Case(
+                models.When(customer=alpha, then=models.F("customer")),
+                default=models.Value(None),
+                output_field=models.BigIntegerField(),
+            ),
+        },
+        having={"sum_total__gt": 400, "sum_total__lt": 500},
+    )
+    assert rows == [
+        {"customer_id": None, "count": 3, "sum_total": Decimal("425.00")},
+    ]

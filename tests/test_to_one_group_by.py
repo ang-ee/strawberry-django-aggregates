@@ -29,9 +29,10 @@ from strawberry_django_aggregates import (
 )
 from strawberry_django_aggregates.errors import (
     AggregationAcrossRelationError,
+    GranularityNotApplicable,
     GroupByFieldNotAllowed,
 )
-from tests.models import Customer, Order, OrderItem
+from tests.models import Customer, CustomerProfile, Order, OrderItem
 
 
 @strawberry_django.filter_type(Order, lookups=True)
@@ -236,6 +237,38 @@ def test_fk_leaf_path_surfaces_id_alias(sample_order_items):
     assert by_customer == {a.pk: 4, b.pk: 2, g.pk: 3}
 
 
+def test_reverse_one_to_one_key_emits_related_pk_scalar(sample_orders):
+    profile = CustomerProfile.objects.create(
+        pk=200, customer=sample_orders[0][0],
+    )
+    built = AggregateBuilder(
+        model=Customer,
+        aggregate_fields=["id"],
+        group_by_fields=["profile"],
+    ).build()
+
+    @strawberry.type
+    class Query:
+        customers_group_by: built.grouped_result_type = built.group_by_field
+
+    schema = strawberry.Schema(query=Query)
+    assert "profile: ID\n" in schema.as_str()
+    result = schema.execute_sync(
+        """
+        query {
+            customersGroupBy(groupBy: [{ field: PROFILE }]) {
+                results { key { profile } count }
+            }
+        }
+        """,
+    )
+    assert result.errors is None, result.errors
+    assert {
+        row["key"]["profile"]: row["count"]
+        for row in result.data["customersGroupBy"]["results"]
+    } == {str(profile.pk): 1, None: 2}
+
+
 # ---------------------------------------------------------------------------
 # choices leaf reached through a to-one hop keeps its stored value in the row
 # ---------------------------------------------------------------------------
@@ -366,25 +399,167 @@ def test_group_by_expression_rejects_an_unselected_path(sample_orders):
     [
         ([('status', None)], None),
         ([('metadata.region', None)], {"metadata.region": "str"}),
-        ([('order__customer', None)], None),
     ],
 )
-def test_group_by_expression_rejects_non_scalar_to_one_axes(
+def test_group_by_expression_rejects_direct_scalar_and_json_axes(
     sample_order_items, group_by, json_paths
 ):
     """Direct and JSON axes retain their native projection owners."""
     with pytest.raises(GroupByFieldNotAllowed, match="to-one"):
         compute_aggregation(
-            (
-                OrderItem.objects.all()
-                if group_by[0][0].startswith("order__")
-                else Order.objects.all()
-            ),
+            Order.objects.all(),
             group_by=group_by,
             aggregates=[(AggregateOp.COUNT, None)],
             json_paths=json_paths,
             group_by_expressions={group_by[0][0]: models.Value(None)},
         )
+
+
+def test_relation_key_expression_merges_nulls(relation_key_case):
+    case = relation_key_case
+    spec = [(case["path"], None)]
+    rows = compute_aggregation(
+        case["queryset"],
+        group_by=spec,
+        aggregates=[(AggregateOp.COUNT, None)],
+        group_by_expressions=case["expressions"],
+        order_by=[(case["alias"], "asc", "last")],
+    )
+    assert rows == case["rows"]
+
+
+def test_relation_key_override_does_not_shadow_measure_source(sample_orders):
+    alpha = sample_orders[0][0]
+    rows = compute_aggregation(
+        Order.objects.all(),
+        group_by=[("customer", None)],
+        aggregates=[
+            (AggregateOp.COUNT, None),
+            (AggregateOp.COUNT_DISTINCT, "customer"),
+        ],
+        group_by_expressions={
+            "customer": models.Case(
+                models.When(customer=alpha, then=models.F("customer")),
+                default=models.Value(None),
+                output_field=models.BigIntegerField(),
+            ),
+        },
+        order_by=[("customer_id", "asc", "last")],
+    )
+    assert rows == [
+        {"customer_id": alpha.pk, "count": 3, "count_distinct_customer": 1},
+        {"customer_id": None, "count": 3, "count_distinct_customer": 2},
+    ]
+    builder = AggregateBuilder(
+        model=Order, aggregate_fields=["total"], group_by_fields=["customer"],
+    )
+    built = builder.build()
+    keys = [
+        builder.shape_group_key(
+            built.group_key_type, row, [("customer", None)],
+        ).customer_id
+        for row in rows
+    ]
+    assert keys == [alpha.pk, None]
+
+
+def test_relation_key_overrides_compose_with_other_axes(sample_orders):
+    rows = compute_aggregation(
+        Order.objects.all(),
+        group_by=[("customer", None), ("customer__name", None)],
+        aggregates=[(AggregateOp.COUNT, None)],
+        group_by_expressions={
+            "customer": models.Value(
+                None, output_field=models.BigIntegerField(),
+            ),
+            "customer__name": models.Value(
+                None, output_field=models.CharField(),
+            ),
+        },
+    )
+    assert rows == [{"customer_id": None, "customer__name": None, "count": 6}]
+
+
+@pytest.mark.parametrize("path", ["items", "items__order"])
+def test_key_override_still_rejects_to_many_paths(sample_orders, path):
+    with pytest.raises(AggregationAcrossRelationError):
+        compute_aggregation(
+            Order.objects.all(),
+            group_by=[(path, None)],
+            aggregates=[(AggregateOp.COUNT, None)],
+            group_by_expressions={path: models.Value(None)},
+        )
+
+
+def test_key_override_still_rejects_granularity(sample_orders):
+    with pytest.raises(GranularityNotApplicable):
+        compute_aggregation(
+            Order.objects.all(),
+            group_by=[("customer", TimeGranularity.MONTH)],
+            group_by_expressions={"customer": models.F("customer")},
+        )
+
+
+def test_streamed_key_overrides_keep_canonical_aliases(sample_orders):
+    expected = [
+        {"customer_id": customer.pk + 100, "count": count}
+        for customer, count in zip(sample_orders[0], [3, 2, 1], strict=True)
+    ]
+    chunks = compute_aggregation(
+        Order.objects.all(),
+        group_by=[("customer", None)],
+        aggregates=[(AggregateOp.COUNT, None)],
+        group_by_expressions={"customer": models.F("customer") + 100},
+        chunk_size=1,
+    )
+    assert list(chunks) == [[row] for row in expected]
+
+
+def test_multiple_relation_key_overrides_keep_distinct_aliases(
+    sample_order_items,
+):
+    rows = compute_aggregation(
+        OrderItem.objects.all(),
+        group_by=[("order", None), ("order__customer", None)],
+        aggregates=[(AggregateOp.COUNT, None)],
+        group_by_expressions={
+            path: models.Value(None, output_field=models.BigIntegerField())
+            for path in ("order", "order__customer")
+        },
+    )
+    assert rows == [{"order_id": None, "order__customer_id": None, "count": 9}]
+
+
+def test_key_override_merges_within_each_remaining_axis(sample_orders):
+    rows = compute_aggregation(
+        Order.objects.all(),
+        group_by=[("customer", None), ("status", None)],
+        aggregates=[(AggregateOp.COUNT, None)],
+        group_by_expressions={
+            "customer": models.Value(
+                None, output_field=models.BigIntegerField(),
+            ),
+        },
+        order_by=[("status", "asc", None)],
+    )
+    assert rows == [
+        {"customer_id": None, "status": "cancelled", "count": 1},
+        {"customer_id": None, "status": "draft", "count": 1},
+        {"customer_id": None, "status": "paid", "count": 4},
+    ]
+
+
+def test_empty_key_overrides_preserve_native_results(relation_key_case):
+    case = relation_key_case
+    kwargs = {
+        "group_by": [(case["path"], None)],
+        "aggregates": [(AggregateOp.COUNT, None)],
+        "order_by": [(case["alias"], "asc", "last")],
+    }
+    native = compute_aggregation(case["queryset"], **kwargs)
+    assert compute_aggregation(
+        case["queryset"], **kwargs, group_by_expressions={},
+    ) == native
 
 
 @pytest.mark.django_db

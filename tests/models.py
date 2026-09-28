@@ -25,6 +25,17 @@ class Customer(models.Model):
         ordering = ["name"]
 
 
+class CustomerProfile(models.Model):
+    """Nullable to-one keys, including a missing reverse relation."""
+
+    customer = models.OneToOneField(
+        Customer, on_delete=models.CASCADE, related_name="profile", null=True,
+    )
+
+    class Meta:
+        app_label = "tests"
+
+
 class Order(models.Model):
     STATUS_CHOICES = [
         ("draft",     "Draft"),

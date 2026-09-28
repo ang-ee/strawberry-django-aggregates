@@ -75,7 +75,8 @@ from strawberry_django_aggregates.granularity import (
 from strawberry_django_aggregates.operators import AggregateOp
 
 if TYPE_CHECKING:
-    from django.db.models import QuerySet
+    from django.db.models import Model, QuerySet
+    from django.db.models.expressions import BaseExpression
     from django.db.models.fields import Field
 
 
@@ -492,13 +493,16 @@ def compute_aggregation(
       Rule 4 separation).
 
     ``group_by_expressions`` replaces the value expression for selected
-    to-one scalar axes while preserving their declared logical
+    to-one scalar, date, or relation-key axes while preserving their logical
     paths and canonical result aliases. The compiler still resolves every
     selected path against the model, validates relation cardinality and
     granularity, and owns grouping, ordering and result shape. Mapping keys
-    must be selected to-one paths; direct fields and JSON paths fail loud
-    because their canonical aliases are already concrete or synthetic
-    projection owners.
+    must be selected to-one paths or direct to-one keys; direct scalar
+    fields and JSON paths fail loud. Relation-key overrides use internal
+    annotations so measures still read the original model columns. Projected
+    null keys merge in SQL; comodel ordering on overridden keys cannot split
+    those groups. Incoming queryset ordering is always discarded; use
+    ``order_by`` to order grouped results (SPEC § 6.2).
 
     ``fill`` enables empty-bucket filling (SPEC § 7.2). When ``True``,
     ``group_by`` MUST contain exactly one ``TimeGranularity`` entry —
@@ -586,7 +590,7 @@ def compute_aggregation(
         _validate_relation_traversal_ops(aggregates)
     _validate_postgres_only(aggregates, vendor)
 
-    group_annotations, group_aliases = _build_group_by_annotations(
+    group_ann, group_aliases, key_aliases = _build_group_by_annotations(
         model, group_by, tzinfo, week_start, json_paths,
         group_by_expressions,
     )
@@ -605,20 +609,21 @@ def compute_aggregation(
         list(aggregate_annotations.keys()),
         model=model,
         respect_comodel_ordering=respect_comodel_ordering,
+        key_aliases=key_aliases,
     )
 
-    qs = queryset
-    has_grouping = bool(group_aliases)
-    if has_grouping:
-        if group_annotations:
-            qs = qs.annotate(**group_annotations)
-        qs = qs.values(*group_aliases)
-        qs = qs.annotate(**aggregate_annotations)
-    else:
-        # Single-row aggregate. Use .aggregate() — Django returns a
-        # plain dict and skips the GROUP BY altogether. (HAVING with
-        # no group_by was rejected at the top of compute_aggregation.)
-        return [qs.aggregate(**aggregate_annotations)]
+    if not group_aliases:
+        # Let Django own single-row aggregation, including ordered slices
+        # that select the source rows. Public .order_by() rejects a slice.
+        # HAVING without group_by was already rejected at entry.
+        return [queryset.aggregate(**aggregate_annotations)]
+
+    qs = queryset.order_by()
+    sql_group_aliases = [key_aliases.get(a, a) for a in group_aliases]
+    if group_ann:
+        qs = qs.annotate(**group_ann)
+    qs = qs.values(*sql_group_aliases)
+    qs = qs.annotate(**aggregate_annotations)
 
     if having_q is not None:
         qs = qs.filter(having_q)
@@ -629,11 +634,16 @@ def compute_aggregation(
         # ``_validate_chunk_size``; user-supplied ``order_by`` is
         # ignored (the keyset cursor needs strict ascending order on
         # the group-by tuple). Returns an iterator of chunks.
-        return _iter_chunks(
+        chunks = _iter_chunks(
             qs=qs,
-            group_aliases=group_aliases,
+            group_aliases=sql_group_aliases,
             chunk_size=chunk_size,
         )
+        if key_aliases:
+            return (
+                _restore_group_aliases(rows, key_aliases) for rows in chunks
+            )
+        return chunks
 
     # Apply user-supplied ordering before fill so the pre-fill rows are
     # in the order the user asked for. Filling re-sorts ascending by
@@ -648,7 +658,7 @@ def compute_aggregation(
         stop = (offset + limit) if limit is not None else None
         qs = qs[offset:stop]
 
-    rows = list(qs)
+    rows = _restore_group_aliases(list(qs), key_aliases)
 
     if fill:
         # Range bounds. When the caller supplies explicit ``fill_min`` /
@@ -691,6 +701,19 @@ def compute_aggregation(
             rows = rows[offset:stop]
 
     return rows
+
+
+def _restore_group_aliases(
+    rows: list[dict[str, Any]], key_aliases: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """Return canonical keys without exposing internal SQL annotations."""
+    if not key_aliases:
+        return rows
+    canonical = {sql: alias for alias, sql in key_aliases.items()}
+    return [
+        {canonical.get(alias, alias): value for alias, value in row.items()}
+        for row in rows
+    ]
 
 
 def _validate_fill_spec(
@@ -1419,22 +1442,41 @@ def _resolve_traversal_chain(
 # group_by annotations
 # ---------------------------------------------------------------------------
 
+class _CallerGroupExpression(Func):
+    """Preserve SQL grouping for every caller-supplied group expression.
+
+    Django normally drops Value expressions from grouping. For an empty
+    queryset that would turn a grouped query into a single zero-input
+    aggregate row, disagreeing with the distinct group count.
+    """
+
+    template = "%(expressions)s"
+    arity = 1
+
+    def get_group_by_cols(self) -> list[BaseExpression]:
+        return [self]
+
+
 def _build_group_by_annotations(
-    model: type,
+    model: type[Model],
     group_by: list[tuple[str, Granularity | None]],
     tzinfo: ZoneInfo,
     week_start: int = 1,
     json_paths: dict[str, str] | None = None,
     group_by_expressions: Mapping[str, Combinable] | None = None,
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], list[str], dict[str, str]]:
     """Build the ``.annotate()`` kwargs that materialize each group_by
-    spec, plus the canonical alias list to feed into ``.values()``.
+    spec, canonical aliases, and a canonical-to-SQL relation-key alias map.
 
-    Non-bucket group_by entries are NOT annotated — Django rejects
+    Native non-bucket group_by entries are NOT annotated — Django rejects
     annotation aliases that collide with concrete model columns
     (e.g. annotating ``customer_id`` on a model with a ``customer``
     FK). They go straight into ``.values(attname)`` and Django emits
     them as a GROUP BY column.
+
+    Overridden relation keys use internal aliases to avoid those collisions
+    and leave original columns available to measures. Callers use the alias
+    map for SQL grouping/ordering and restore canonical output keys.
 
     JSON-path entries (``metadata.region``) ARE always annotated, even
     without a granularity — the alias name (``metadata__region``) is
@@ -1444,6 +1486,7 @@ def _build_group_by_annotations(
     """
     annotations: dict[str, Any] = {}
     aliases:     list[str]      = []
+    key_aliases: dict[str, str] = {}
     expressions = group_by_expressions or {}
     selected_group_paths = {field_path for field_path, _ in group_by}
     if unknown_expressions := sorted(set(expressions) - selected_group_paths):
@@ -1502,23 +1545,33 @@ def _build_group_by_annotations(
             )
         alias = group_by_alias(field_path, granularity, field)
         if has_override:
-            if "__" not in field_path or getattr(field, "is_relation", False):
+            is_to_one_key = bool(
+                getattr(field, "many_to_one", False)
+                or getattr(field, "one_to_one", False)
+            )
+            if not is_to_one_key and "__" not in field_path:
                 raise GroupByFieldNotAllowed(
-                    "group_by_expressions supports to-one scalar or "
-                    f"date paths; `{field_path}` is a direct or relationship "
-                    "key."
+                    "group_by_expressions supports to-one scalar, date, "
+                    f"or relation-key paths; `{field_path}` is a direct "
+                    "scalar field."
                 )
             annotations[alias] = _build_group_by_expression(
                 field_path, granularity, field, tzinfo, week_start,
-                source_expression=expressions[field_path],
+                source_expression=_CallerGroupExpression(
+                    expressions[field_path],
+                ),
             )
+            if is_to_one_key:
+                internal = f"_sda_{alias}"
+                annotations[internal] = annotations.pop(alias)
+                key_aliases[alias] = internal
         elif granularity is not None:
             annotations[alias] = _build_group_by_expression(
                 field_path, granularity, field, tzinfo, week_start,
             )
         aliases.append(alias)
 
-    return annotations, aliases
+    return annotations, aliases, key_aliases
 
 
 def _build_group_by_expression(
@@ -2269,6 +2322,7 @@ def _build_order_terms(
     *,
     model: type | None = None,
     respect_comodel_ordering: bool = False,
+    key_aliases: Mapping[str, str] | None = None,
 ) -> list[Any]:
     """Translate ``[(alias, direction, nulls)]`` into queryset-ready
     expressions, validating each alias against the group_by + aggregate
@@ -2291,6 +2345,7 @@ def _build_order_terms(
     )
     valid = set(group_aliases) | set(aggregate_aliases)
     group_alias_set = set(group_aliases)
+    key_aliases = key_aliases or {}
     terms: list[Any] = []
     for alias, direction, nulls in order_by:
         if alias not in valid:
@@ -2301,7 +2356,7 @@ def _build_order_terms(
             )
         nulls_first = True if nulls == "first" else None
         nulls_last = True if nulls == "last" else None
-        expr = F(alias)
+        expr = F(key_aliases.get(alias, alias))
         if direction == "desc":
             terms.append(expr.desc(
                 nulls_first=nulls_first, nulls_last=nulls_last,
@@ -2314,6 +2369,7 @@ def _build_order_terms(
             respect_comodel_ordering
             and model is not None
             and alias in group_alias_set
+            and alias not in key_aliases
         ):
             for extra in comodel_ordering_terms(model, alias):
                 terms.append(_term_to_expression(extra))

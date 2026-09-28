@@ -5,6 +5,36 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.13.0] — 2026-09-28
+
+### Added
+
+- **Caller-owned expressions for to-one relation group keys.**
+  `compute_aggregation(..., group_by_expressions=...)` and
+  `AggregateBuilder.count_groups(..., group_by_expressions=...)` now accept
+  direct and nested foreign-key and one-to-one keys. Expressions group in
+  SQL: projected null keys merge into one bucket with exact counts and
+  measures. Internal annotations preserve original measure sources and
+  canonical output aliases. Ordering, HAVING and offset pagination use the
+  projected groups; comodel tiebreakers cannot split overridden keys.
+  Direct scalar, JSON, to-many and unselected paths remain rejected.
+  Existing group-key aliases are unchanged.
+
+### Fixed
+
+- **The grouping primitive owns ordering.** Incoming queryset ordering is
+  always discarded; use `compute_aggregation(..., order_by=...)` to order
+  groups. Callers passing an ordered queryset without `order_by` previously
+  got split groups, even without expression overrides.
+- **Constant scalar-leaf projections preserve SQL grouping.** Empty querysets
+  now return no grouped rows, matching `count_groups`, for every caller-owned
+  group expression.
+- **Reverse one-to-one group keys build successfully.** Relation keys use the
+  scalar type of their target field (normally the related primary key),
+  including reverse one-to-one accessors, instead of failing on missing
+  choices metadata. This also corrects existing custom-key relation SDL:
+  a character target now emits `String` instead of `ID`, for example.
+
 ## [0.12.0] — 2026-09-06
 
 ### Added

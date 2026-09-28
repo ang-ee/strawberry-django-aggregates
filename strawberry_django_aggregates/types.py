@@ -413,7 +413,8 @@ def _choices_enum_for(
     """
     if type(field).__name__ in {"DateField", "DateTimeField", "TimeField"}:
         return None
-    if not field.choices:
+    choices = getattr(field, "choices", None)
+    if not choices:
         return None
 
     path = axis_path if axis_path is not None else field.name
@@ -439,7 +440,7 @@ def _choices_enum_for(
         members = []
         seen_names: dict[str, Any] = {}
         seen_values: dict[Any, str] = {}
-        for value, label in field.choices:
+        for value, label in choices:
             member_name = _sanitize_member_name(str(value))
             if not member_name or member_name[0].isdigit():
                 member_name = _sanitize_member_name(str(label))
@@ -1210,9 +1211,12 @@ def _emit_group_key(
         field = resolve_field_to_one_only(
             model, field_name, GroupByFieldNotAllowed,
         )
+        # Relation keys, including reverse OneToOneRel, use the target field's
+        # scalar type rather than the relation descriptor's fallback type.
+        key_field = getattr(field, "target_field", field)
         # FK fields surface as `<name>_id` per SPEC § 4.
         if getattr(field, "many_to_one", False):
-            py_type = _natural_python_type(field)  # type: ignore[arg-type]
+            py_type = _natural_python_type(key_field)
             fk_id_name = group_by_alias(field_name, None, field)
             key_fields.append((fk_id_name, (py_type | None), None))
             fk_field_names.append(fk_id_name)
@@ -1228,7 +1232,7 @@ def _emit_group_key(
             py_type = (
                 choices_enum
                 if choices_enum is not None
-                else _natural_python_type(field)  # type: ignore[arg-type]
+                else _natural_python_type(key_field)
             )
             key_fields.append((field_name, (py_type | None), None))
 

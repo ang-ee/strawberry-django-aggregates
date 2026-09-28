@@ -199,3 +199,65 @@ def test_count_groups_rejects_expressions_without_grouping(order_builder):
             {},
             group_by_expressions={"customer__name": models.Value(None)},
         )
+
+
+@pytest.mark.parametrize("having", [{}, {"count__gt": 2}, {"count__gt": 99}])
+def test_count_groups_with_relation_key_override(
+    relation_key_case, having, django_assert_num_queries,
+):
+    case = relation_key_case
+    builder = AggregateBuilder(
+        model=case["queryset"].model,
+        aggregate_fields=["id"],
+        group_by_fields=[case["path"]],
+    )
+    expected = sum(
+        row["count"] > having.get("count__gt", 0) for row in case["rows"]
+    )
+    with django_assert_num_queries(1):
+        count = builder.count_groups(
+            case["queryset"].order_by("pk"),
+            [(case["path"], None)],
+            [(AggregateOp.COUNT, None)],
+            having,
+            group_by_expressions=case["expressions"],
+        )
+    assert count == expected
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [("customer", None), ("customer", 17), ("customer__name", "x")],
+)
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("having", [{}, {"count__gte": 0}, {"count__gt": 6}])
+def test_constant_group_expression_rows_and_count_agree(
+    sample_orders, order_builder, path, value, empty, having,
+):
+    from django.db import models
+
+    from strawberry_django_aggregates import compute_aggregation
+    from tests.models import Order
+
+    qs = Order.objects.filter(pk=-1) if empty else Order.objects.all()
+    spec = [(path, None)]
+    requested = [(AggregateOp.COUNT, None)]
+    alias = "customer_id" if path == "customer" else path
+    output_field = (
+        models.BigIntegerField() if path == "customer" else models.CharField()
+    )
+    expressions = {
+        path: models.Value(value, output_field=output_field),
+    }
+    rows = compute_aggregation(
+        qs, group_by=spec, aggregates=requested, having=having,
+        group_by_expressions=expressions,
+    )
+    expected = (
+        [] if empty or "count__gt" in having
+        else [{alias: value, "count": 6}]
+    )
+    assert rows == expected
+    assert order_builder.count_groups(
+        qs, spec, requested, having, group_by_expressions=expressions,
+    ) == len(expected)

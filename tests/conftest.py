@@ -123,3 +123,61 @@ def sample_order_items(sample_orders):
         items_by_order[order.pk].append(item)
 
     return customers, orders, items_by_order
+
+
+@pytest.fixture(params=[
+    "foreign_key", "foreign_key_leaf", "one_to_one", "one_to_one_leaf",
+    "reverse_one_to_one", "reverse_one_to_one_leaf",
+])
+def relation_key_case(request, sample_order_items):
+    """Direct/nested to-one keys with two hidden identities and nulls."""
+    from django.db import models
+
+    from tests.models import Customer, CustomerProfile, Order, OrderItem
+
+    customers, _orders, _items = sample_order_items
+    profiles = [
+        CustomerProfile.objects.create(customer=customer)
+        for customer in customers
+    ]
+    CustomerProfile.objects.create(customer=None)
+    Customer.objects.create(name="No profile")
+    alpha = customers[0]
+    profile = profiles[0]
+    cases = {
+        "foreign_key": (Order, "customer", "customer_id", alpha.pk, 3, 3),
+        "foreign_key_leaf": (
+            OrderItem, "order__customer", "order__customer_id", alpha.pk, 4, 5,
+        ),
+        "one_to_one": (
+            CustomerProfile, "customer", "customer", alpha.pk, 1, 3,
+        ),
+        "one_to_one_leaf": (
+            Order, "customer__profile__customer",
+            "customer__profile__customer", alpha.pk, 3, 3,
+        ),
+        "reverse_one_to_one": (
+            Customer, "profile", "profile", profile.pk, 1, 3,
+        ),
+        "reverse_one_to_one_leaf": (
+            Order, "customer__profile", "customer__profile", profile.pk, 3, 3,
+        ),
+    }
+    model, path, alias, visible, visible_count, null_count = (
+        cases[request.param]
+    )
+    expression = models.Case(
+        models.When(**{path: visible}, then=models.F(path)),
+        default=models.Value(None),
+        output_field=models.BigIntegerField(),
+    )
+    return {
+        "queryset": model.objects.all(),
+        "path": path,
+        "alias": alias,
+        "expressions": {path: expression},
+        "rows": [
+            {alias: visible, "count": visible_count},
+            {alias: None, "count": null_count},
+        ],
+    }

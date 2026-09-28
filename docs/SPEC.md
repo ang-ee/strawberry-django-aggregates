@@ -784,15 +784,16 @@ to every caller; row-level scoping is the queryset's responsibility per
 CLAUDE.md Critical Rule 1. We do NOT add a `user`-aware filter on
 JSON-path values; the queryset is trusted.
 
-### 6.2 · Forward to-one relation group-by axes
+### 6.2 · To-one relation group-by axes
 
 A `group_by` axis may walk a **to-one** relation to a scalar leaf on the
 related model — a forward `ForeignKey` / `OneToOneField`, or a reverse
 `OneToOneField` accessor. The defining property is "resolves to **at most one**
 related row per parent" (the walk rejects any segment for which
 `_is_relation_to_many` is true — reverse FK one-to-many and many-to-many);
-both directions of a one-to-one qualify. The axis is addressed with Django's
-own `__` separator:
+both directions of a one-to-one qualify at the primitive and schema levels.
+Relation keys use the scalar type of their target field (normally the related
+primary key). The axis is addressed with Django's own `__` separator:
 
 ```graphql
 ordersGroupBy(groupBy: [{ field: CUSTOMER__ACTIVE }])
@@ -817,7 +818,7 @@ with `AggregationAcrossRelationError` (see § 11) — the to-one allowance does
 not weaken Critical Rule 4; it carves out the one join shape that provably
 cannot multiply.
 
-**Multi-hop.** Every non-leaf segment must be a forward to-one relation;
+**Multi-hop.** Every non-leaf segment must be a to-one relation;
 the chain may be arbitrarily long (`order__customer__region__name`). The
 first to-many segment encountered raises — the path is validated segment by
 segment, left to right.
@@ -840,7 +841,7 @@ enum member is the upper-cased path (`CUSTOMER__ACTIVE`). Both are stable
 across builds (Critical Rule 2).
 
 **`_id` suffix is FK-only.** The `_id` surfacing applies to a `many_to_one`
-(FK) leaf. A forward `OneToOneField` leaf is `many_to_one = False`, so it
+(FK) leaf. A forward or reverse one-to-one leaf is `many_to_one = False`, so it
 surfaces under the **bare path** (no `_id`), keyed off the related row — the
 type emitter and the resolver share `group_by_alias`, so they stay mutually
 consistent either way.
@@ -882,7 +883,8 @@ from the same walk. Direction is `types.py` / `builder.py` → `compiler.py`
 
 **Caller-owned value expressions.** `compute_aggregation(...,
 group_by_expressions={path: expression})` lets a composition layer replace
-the SQL value expression for a selected to-one scalar or date leaf
+the SQL value expression for a selected to-one scalar, date, or relation-key
+leaf (including a direct `customer` key or a nested `order__customer` key)
 without replacing the logical axis. `AggregateBuilder.count_groups` accepts
 the same mapping. Both paths apply the override before temporal truncation,
 then reuse the native alias, grouping, ordering, HAVING, pagination, result
@@ -892,12 +894,48 @@ related.label ELSE NULL END`; the core remains permission-naive and never
 derives an actor itself.
 
 Every mapping key must also occur in the translated `group_by` spec. Direct
-model fields, JSON paths, and relationship-key leaves reject overrides with
-`GroupByFieldNotAllowed`; those axes already have concrete or synthetic
-projection owners. To-many paths retain the normal refusal. This narrow
-contract prevents callers from creating undeclared keys or silently
-shadowing a concrete model column. Grouped rows and `count_groups` must receive
-the same mapping whenever exact cardinality is exposed.
+scalar fields and JSON paths reject overrides with `GroupByFieldNotAllowed`;
+to-many paths retain the normal refusal. Forward foreign keys and both
+directions of one-to-one keys accept overrides. Canonical aliases stay the
+same: `customer_id`, `order__customer_id`, and the bare path for one-to-one
+keys. The compiler uses internal annotations named `_sda_<canonical alias>`
+for overridden relation keys, assigned in group-by declaration order, and
+restores canonical aliases in returned rows. The `_sda_` prefix is reserved
+for the library's internal annotations; callers must not use it for model
+fields or queryset annotations/selects. Underlying columns remain available
+unchanged to measures and expression sources.
+
+Caller expressions must carry an `output_field`, explicitly or through
+Django's field inference. In particular, bare `Value(None)` raises
+`OutputFieldIsNoneError`; use `Value(None, output_field=...)` with the
+appropriate Django field. Every caller-supplied expression retains SQL
+grouping, including constant scalar-leaf and relation-key projections: an
+empty queryset yields no groups and an exact group count of zero.
+
+A relation-key expression such as `CASE WHEN customer_id IN (<readable ids>)
+THEN customer_id ELSE NULL END` merges all projected null keys into **one
+SQL group**, including any naturally null keys, within each remaining group
+axis. Counts and measures reflect all contributing rows exactly. Redacting
+only a label leaves an unmodified relation-key axis distinct; callers that
+want identities merged must override the key itself. Grouped rows and
+`count_groups` must receive the same mapping whenever exact cardinality is
+exposed. Existing group-key aliases are preserved.
+
+Ordering and offset pagination use the projected key under its canonical
+alias. The primitive owns ordering: incoming queryset ordering is always
+discarded; use `order_by`. Explicit aggregate/group ordering still applies.
+Ungrouped aggregation delegates to Django's `.aggregate()`, preserving any
+ordered queryset slice that selects its source rows.
+Consumers must pin `nulls` placement (`"first"` or `"last"`) when ordering
+null-merging keys, because SQLite and PostgreSQL have different defaults.
+Comodel-derived tiebreakers are omitted for overridden keys even with
+`respect_comodel_ordering=True`,
+because ordering by original related values would split merged buckets.
+The native cursor-paginated GraphQL field does not accept expression
+overrides; this API is for the backend primitive and custom grouped envelopes.
+The existing streaming keyset restriction also applies: `chunk_size` cannot
+advance from a NULL key; on PostgreSQL this surfaces on the last page. Use
+ordinary rows and offset pagination when an expression can project null keys.
 
 **Versioning.** New groupable-field enum members + new `<Model>GroupKey`
 fields are **additive** ⇒ **minor** (Critical Rule 10).

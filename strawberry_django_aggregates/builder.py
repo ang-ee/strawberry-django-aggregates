@@ -948,7 +948,7 @@ class AggregateBuilder:
         _validate_postgres_only(requested, vendor)
         tzinfo = _resolve_tzinfo(settings.TIME_ZONE)
 
-        group_ann, group_aliases = _build_group_by_annotations(
+        group_ann, group_aliases, _key_aliases = _build_group_by_annotations(
             qs.model, spec, tzinfo, week_start, self.json_paths,
         )
         agg_ann = _build_aggregate_annotations(
@@ -1535,10 +1535,12 @@ class AggregateBuilder:
         vendor = connections[qs.db].vendor
         _validate_postgres_only(requested, vendor)
         tzinfo = _resolve_tzinfo(tz or settings.TIME_ZONE)
-        group_ann, group_aliases = _build_group_by_annotations(
+        group_ann, group_aliases, key_aliases = _build_group_by_annotations(
             qs.model, spec, tzinfo, week_start, self.json_paths,
             group_by_expressions,
         )
+        if key_aliases:
+            group_aliases = [key_aliases.get(a, a) for a in group_aliases]
 
         if not having_dict:
             cqs = qs
