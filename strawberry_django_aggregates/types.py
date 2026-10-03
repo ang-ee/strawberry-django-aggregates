@@ -390,6 +390,10 @@ def _choices_enum_for(
     names are derived deterministically from the value (or, for empty /
     digit-leading values such as integer choices, from the label).
 
+    Blank-allowed fields gain an implicit ``BLANK = ""`` member unless
+    an explicit empty choice already exists. Occupied names use the first
+    free ``BLANK_2``, ``BLANK_3``, etc. Null remains separate (SPEC § 4.3).
+
     A name collision between two members raises
     :class:`ChoicesEnumCollisionError` (fail-loud) — we never silently
     deduplicate.
@@ -480,6 +484,17 @@ def _choices_enum_for(
             seen_names[member_name] = value
             seen_values[value] = member_name
             members.append((member_name, value))
+
+    if field.blank and not any(value == "" for _, value in members):
+        # Own the blank vocabulary here so type emission, row coercion,
+        # public key shaping and filter echo all use the same enum.
+        names = {name for name, _ in members}
+        blank_name = "BLANK"
+        suffix = 2
+        while blank_name in names:
+            blank_name = f"BLANK_{suffix}"
+            suffix += 1
+        members.append((blank_name, ""))
 
     enum_cls = enum.Enum(type_name, members)  # type: ignore[misc]
     built: type[enum.Enum] = strawberry.enum(enum_cls)

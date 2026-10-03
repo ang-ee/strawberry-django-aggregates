@@ -126,7 +126,7 @@ from strawberry_django_aggregates.types import (
     python_type_for_json,
 )
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 __all__ = [
     # Builder (high-level)

@@ -1613,7 +1613,8 @@ class AggregateBuilder:
             # A ``choices``-backed group-by column is typed as a GraphQL
             # enum on ``<Model>GroupKey`` (see ``types._choices_enum_for``);
             # the compiler row carries the raw stored value, so coerce it
-            # to the matching enum member here. ``None`` stays ``None``;
+            # to the matching enum member here, including the explicit
+            # empty member for blank-allowed fields. ``None`` stays None;
             # FK / date / non-choices columns return ``None`` from the
             # helper and pass through unchanged. The field→enum mapping is
             # single-sourced in ``types.py`` (cached), so this returns the

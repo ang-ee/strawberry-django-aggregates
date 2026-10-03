@@ -99,3 +99,18 @@ class Task(models.Model):
 
     class Meta:
         app_label = "tests"
+
+
+class ChoiceRecord(models.Model):
+    """Blank and null are separate stored values on a choices field."""
+
+    country = models.CharField(
+        max_length=2,
+        choices=[("CZ", "Czechia"), ("US", "United States")],
+        blank=True,
+        null=True,
+        default="",
+    )
+
+    class Meta:
+        app_label = "tests"
