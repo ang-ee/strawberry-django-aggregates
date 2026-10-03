@@ -312,7 +312,8 @@ def test_unresolvable_member_name_raises(db):
 # Fail-loud when a stored row value is outside the declared choices
 # ---------------------------------------------------------------------------
 
-def test_out_of_choices_value_raises(db):
+@pytest.mark.parametrize("value", ["legacy", ""])
+def test_out_of_choices_value_raises(db, value):
     """``choices`` is a Django validation concern, not a DB constraint, so
     a column may legally hold a value no longer in the choices list. The
     resolver coerces grouped rows to the emitted enum; an out-of-choices
@@ -324,7 +325,7 @@ def test_out_of_choices_value_raises(db):
     customer = Customer.objects.create(name="Legacy")
     # ``create`` does not run model validation — Django inserts the row.
     Order.objects.create(
-        customer=customer, status="legacy",
+        customer=customer, status=value,
         created_at=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
     )
 
@@ -347,5 +348,65 @@ def test_out_of_choices_value_raises(db):
     assert result.errors is not None, "expected the resolver to fail loud"
     original = result.errors[0].original_error
     assert isinstance(original, ChoicesValueNotInEnumError), original
-    assert "legacy" in str(original)
+    assert repr(value) in str(original)
     assert "OrderStatus" in str(original)
+
+
+@pytest.mark.parametrize("use_choices_enum", [False, True])
+def test_blank_allowed_choices_add_empty_member(use_choices_enum):
+    class State(enum.Enum):
+        IN_PROGRESS = "wip"
+
+    field = models.CharField(
+        max_length=8, choices=[("wip", "In progress")], blank=True,
+    )
+    field.name = "state"
+    if use_choices_enum:
+        field.choices_enum = State
+    built = _choices_enum_for(field, f"BlankAllowed{use_choices_enum}")
+    assert {m.name: m.value for m in built} == {
+        "IN_PROGRESS" if use_choices_enum else "WIP": "wip",
+        "BLANK": "",
+    }
+    assert list(State) == [State.IN_PROGRESS]
+
+
+@pytest.mark.parametrize("blank", [False, True])
+@pytest.mark.parametrize("use_choices_enum", [False, True])
+def test_explicit_empty_choice_preserves_member(blank, use_choices_enum):
+    class State(enum.Enum):
+        NOT_SET = ""
+        READY = "ready"
+
+    field = models.CharField(
+        max_length=8, choices=[("", "Not set"), ("ready", "Ready")],
+        blank=blank,
+    )
+    field.name = "state"
+    if use_choices_enum:
+        field.choices_enum = State
+    built = _choices_enum_for(
+        field, f"ExplicitEmpty{blank}{use_choices_enum}",
+    )
+    assert {m.name: m.value for m in built} == {
+        "NOT_SET": "", "READY": "ready",
+    }
+
+
+@pytest.mark.parametrize("use_choices_enum", [False, True])
+def test_implicit_blank_member_preserves_declared_names(use_choices_enum):
+    class State(enum.Enum):
+        BLANK = "blank"
+        BLANK_2 = "blank_2"
+
+    field = models.CharField(
+        max_length=8, choices=[("blank", "Blank"), ("blank_2", "Blank 2")],
+        blank=True,
+    )
+    field.name = "state"
+    if use_choices_enum:
+        field.choices_enum = State
+    built = _choices_enum_for(field, f"BlankNameCollision{use_choices_enum}")
+    assert {m.name: m.value for m in built} == {
+        "BLANK": "blank", "BLANK_2": "blank_2", "BLANK_3": "",
+    }

@@ -315,11 +315,28 @@ enum OrderStatus { DRAFT, PAID, CANCELLED }
 
 **Resolver coercion.** Grouped rows carry the **raw** stored value (`"paid"`); the resolver coerces it to the matching enum member, so the wire serializes the member **name** (`"PAID"`). `None` stays `None`. The cursor-pagination keyset (§ 4.1) operates on the raw stored values — a cursor carries `"paid"` while the wire shows `"PAID"`; both name the same group, and a decoded cursor is mapped back through the emitted enum to recover the wire name.
 
+**Blank-allowed choices.** When `field.blank` is true, a stored `""` is a
+legitimate, explicit bucket, separate from the `None` / GraphQL `null` bucket.
+If the declared choices already contain `""`, their existing member name is
+preserved. Otherwise the generated group-key enum appends `BLANK = ""`;
+if `BLANK` is occupied, it uses the first available `BLANK_2`, `BLANK_3`,
+and so on, preserving all declared names and values. The field stays enum
+typed, and `AggregateBuilder.shape_group_key` exposes the empty stored value
+through the member's `.value`. A scalar drill-down filter uses
+`{ field: { _eq: "" } }` in a consumer with `_eq` lookups, or
+`{ field: { exact: "" } }` with strawberry-django's default string lookup
+(including the native filter echo, § 4.4). Null keeps its `isNull: true`
+filter. `blank=False` does not gain an implicit empty member.
+
 **Fail-loud (Critical Rules 2 / 3 / 6).** The vocabulary is the contract, so ambiguity is refused rather than silently dropped:
 
 - Two choices deriving the same member **name**, or sharing the same stored **value** (which `enum.Enum` would silently alias), raise `ChoicesEnumCollisionError`.
 - A choice whose value **and** label both sanitize to an empty or digit-leading name raises `ChoicesEnumNameError`.
-- A grouped row whose stored value is **not** among the field's choices — legal in Django, since `choices` is validation, not a DB constraint — raises `ChoicesValueNotInEnumError` at coercion, naming the field, value, and enum, rather than surfacing a bare `ValueError` mid-serialization.
+- A grouped row whose stored value is **not** among the field's choices
+  (except `""` when `field.blank` is true) — legal in Django, since `choices`
+  is validation, not a DB constraint — raises `ChoicesValueNotInEnumError`
+  at coercion, naming the field, value, and enum, rather than surfacing a
+  bare `ValueError` mid-serialization.
 
 All three derive from `AggregateError` and are re-exported from the package root. The escape hatch for every collision/name case is the same: supply a django-choices-field `choices_enum` with explicit member names.
 

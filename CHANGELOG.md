@@ -5,6 +5,20 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.13.1] — 2026-10-03
+
+### Fixed
+
+- **Blank-allowed choices group into an explicit empty bucket.** A stored
+  `""` on a choices field with `blank=True` now maps to `BLANK = ""` in the
+  generated group-key enum, separate from the null bucket. Existing explicit
+  empty choices keep their member names; occupied `BLANK` names use the first
+  free `BLANK_2`, `BLANK_3`, etc. Public key shaping retains the empty stored
+  value for scalar drill-down filters (`_eq: ""` in consumer schemas;
+  `exact: ""` in the native filter echo). Other out-of-range values, including
+  an undeclared blank on `blank=False` fields, still raise
+  `ChoicesValueNotInEnumError`.
+
 ## [0.13.0] — 2026-09-28
 
 ### Added
