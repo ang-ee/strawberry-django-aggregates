@@ -1329,6 +1329,8 @@ The return type is a union: `list[dict[str, Any]] | Iterator[list[dict[str, Any]
 | `HavingFieldNotAllowed` | `having` references an unknown alias |
 | `GranularityNotApplicable` | `granularity` is set on a non-date / non-datetime field |
 
+The in-memory sibling for computed rows, `compute_row_aggregation`, shares this table's errors; see § 20.
+
 ## 11 · Why no auto-traversal for o2m / m2m measures (and the explicit opt-in)
 
 ### Default behaviour: refuse
@@ -1422,6 +1424,7 @@ strawberry_django_aggregates/
 ├── operators.py           # AggregateOp enum + per-field-type defaults
 ├── granularity.py         # TimeGranularity / NumberGranularity + part mapping
 ├── compiler.py            # compute_aggregation backend primitive
+├── rows.py                # make_row_model + compute_row_aggregation (§ 20)
 ├── ordering.py            # parse_aggregate_order (fail-loud)
 └── errors.py              # exception hierarchy
 
@@ -1579,3 +1582,100 @@ They never mutate the compiler row or change grouping, measures, ordering or
 cardinality. Null keys bypass the codec; configuring a codec for a selected
 date/number bucket raises ValueError. Choices enum coercion and native time
 bucket ranges continue to belong to the builder.
+
+## 20 · Grouping computed rows
+
+Some resources are not Django tables: their rows come from Python (schema
+introspection, a foreign API, a computed report). They need the same grouping
+contract as a queryset, so a client cannot tell the two apart. The library
+therefore separates the two things grouping needs — **field facts** and
+**execution** — and keeps one owner for each rule.
+
+**Field facts: `make_row_model(name, columns)`.** Declares the row columns as
+an *abstract* Django model: real `Field` instances, no table, no manager, no
+primary key, never registered with the app registry. `columns` maps a column
+name to `bool`, `int`, `float`, `Decimal`, `str`, `datetime`, `date`, `time`,
+`UUID`, or an `Enum` subclass with all-str or all-int values. Every column is
+nullable. An enum column becomes a choices field carrying the enum as
+`choices_enum`, so its group key reuses the enum's member names and values
+(§ 4.3). Column names must be identifiers without leading or trailing
+underscores or `__` that do not shadow a Django model attribute (`pk`,
+`save`, `Meta`, …); anything else raises `TypeError`. The registry must be
+ready (call after `django.setup()`). Build each row model once, at import:
+generated enum types are cached per type prefix and column (§ 4.3), so a
+later row model reusing a prefix and column keeps the first vocabulary.
+
+Because every type generator and `AggregateBuilder` translator reads field
+facts from `model._meta`, a row model is passed as `model=` unchanged.
+`AggregateBuilder(model=row_model, group_by_fields=[...])` emits the same
+`<Model>GroupKey` / `<Model>GroupBySpec` / `<Model>Having` /
+`<Model>GroupOrder` types as a queryset model with the same columns, and
+`translate_group_by` / `translate_having` / `translate_order_by` /
+`shape_group_key` work as documented in § 10. There is no parallel type
+emitter. A row model's measures default to none (the aggregate, HAVING and
+order inputs carry `count` only); a non-empty `aggregate_fields` or any
+`json_paths` raises `AggregateError` at build, because the row executor could
+not serve them. The builder's own query fields need a queryset: with a row
+model and no `get_queryset` they raise `AggregateError` naming
+`compute_row_aggregation`.
+
+**Execution: `compute_row_aggregation(rows, *, model, group_by, aggregates,
+having, order_by, offset, limit, tz, week_start)`.** The in-memory sibling of
+`compute_aggregation`. Arguments mirror it, and it returns the same flat
+`list[dict]` (canonical group aliases plus aggregate aliases), so the builder
+shapers apply unchanged. Rows are mappings or attribute objects. A row
+without a grouped column, or a value that does not match its column's
+declared type (a `datetime` in a `date` column, an `int` in a `str` column),
+raises `AggregateError` naming the column. Rows are permission-naive input
+(Critical Rule 1).
+
+- **Axes.** Direct scalar columns only. Relation paths, relation fields and
+  JSON fields raise `GroupByFieldNotAllowed`. Granularity applies to date and
+  datetime columns — the columns whose group key carries bucket fields;
+  time-of-day granularities on a `date` column, and any granularity on
+  another type, raise `GranularityNotApplicable`. Axes whose result keys
+  would overwrite each other (a bucket alias equal to another column, or a
+  column named like a measure alias such as `count`) raise
+  `GroupByFieldNotAllowed`, as Django refuses the same SQL annotations.
+- **Keys.** The raw value is the key, so NULL and `""` are distinct buckets.
+  An enum member groups by its stored `.value`, as `.values()` returns for a
+  choices column. Datetimes are read as Django reads a `DateTimeField`: with
+  `USE_TZ`, a naive value is in the default timezone, an unbucketed key is
+  the UTC instant (what the database returns), and a bucketed axis converts
+  to `tz` (default `settings.TIME_ZONE`) *before* truncation (Critical
+  Rule 5); without `USE_TZ`, values keep their own wall clock. TIME buckets
+  reuse the dense-fill spine's Python `date_trunc` (§ 7.2), label an
+  ambiguous local time with its first occurrence, and keep the input kind (a
+  `date` buckets to a `date`, as `Trunc` does for a `DateField`). NUMBER
+  parts match `Extract`, including the `week_start` rotation of
+  `DAY_OF_WEEK` (§ 7.1).
+- **Measures.** `COUNT` only. Any other operator raises
+  `OperatorNotSupportedError` before rows are read; aggregate a queryset for
+  other measures. Further operators are additive (minor) once their Python
+  value semantics are specified here.
+- **HAVING and ordering.** HAVING keys and order terms go through the
+  compiler's own HAVING parser and order-term validation, so unknown names
+  fail with the same errors (Critical Rule 6). A NULL measure fails every
+  HAVING comparison. Groups first sort by their key tuple ascending with NULLs
+  last, a deterministic default independent of row order. (Equal values
+  written differently, such as `Decimal("1.0")` and `Decimal("1.00")`, form
+  one group labeled by the first row's spelling.) `order_by` then applies
+  through the same in-memory orderer the dense-fill path uses: `asc` puts
+  NULLs last and `desc` first unless `nulls` says otherwise. Strings sort by
+  Python code point, not a database collation.
+- **Paging and cardinality.** `offset` / `limit` slice the ordered groups and
+  must be non-negative. Without `group_by` the result is a single row and
+  paging is ignored, exactly like `compute_aggregation`. The exact group
+  cardinality is the length of the unpaged result.
+
+Parity is tested by grouping the same orders through both paths for every
+granularity, timezone and week start. Two differences the SQL path shows on
+SQLite are excluded there and pinned for the row path instead: SQLite's
+`DAY_OF_YEAR` ignores `tz`, and a non-Monday `WEEK` bucket in a non-UTC `tz`
+comes back labeled UTC (the outer expression wrapping the shifted `Trunc`
+drops its timezone conversion; other vendors are not yet verified). In both
+cases the row path follows Critical Rule 5.
+
+`rows.py` is framework-agnostic (Critical Rule 9): it imports Django for field
+facts and settings, never Strawberry. Both functions are public, additive API
+(minor version, § 16).

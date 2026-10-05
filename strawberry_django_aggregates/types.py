@@ -59,6 +59,7 @@ from strawberry_django_aggregates.operators import (
     default_operators_for,
     default_operators_for_json_type,
 )
+from strawberry_django_aggregates.rows import is_row_model
 
 if TYPE_CHECKING:
     from django.db.models import Model
@@ -627,6 +628,10 @@ def _resolve_aggregate_fields(
     _validate_json_paths(json_paths)
     if aggregate_fields is not None:
         return list(aggregate_fields)
+    if is_row_model(model):
+        # Row-model rows are grouped in memory, which counts only
+        # (SPEC § 20) — no default measures.
+        return []
     eligible: list[str] = []
     for field in model._meta.get_fields():
         # Skip reverse relations (auto-created) and many-to-many.

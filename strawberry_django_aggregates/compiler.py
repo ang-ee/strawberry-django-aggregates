@@ -16,7 +16,7 @@ modules only — never from ``strawberry`` or ``strawberry_django``.
 from __future__ import annotations
 
 import datetime
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, overload
 from zoneinfo import ZoneInfo
 
@@ -984,7 +984,9 @@ def _apply_order_to_rows(
     """Re-apply user ``order_by`` terms to a Python list of result rows.
 
     Used after empty-bucket filling — the SQL ORDER BY can't reach the
-    in-memory filler rows. Each ``(alias, direction, nulls)`` triple is
+    in-memory filler rows — and by ``rows.compute_row_aggregation``, so
+    both in-memory paths share one ordering rule. Each
+    ``(alias, direction, nulls)`` triple is
     applied via a stable sort, in reverse priority so the highest-
     priority key wins.
 
@@ -1003,14 +1005,18 @@ def _apply_order_to_rows(
         else:
             nulls_last = nulls == "last"
 
+        # ``reverse=True`` flips the whole key, null group included, so
+        # pre-flip the null group to keep the requested placement.
+        null_rank = 1 if nulls_last != reverse else -1
+
         def keyfn(
             row: dict[str, Any],
             _alias: str = alias,
-            _nulls_last: bool = nulls_last,
+            _null_rank: int = null_rank,
         ) -> tuple[int, Any]:
             v = row.get(_alias)
             if v is None:
-                return (1 if _nulls_last else -1, v)
+                return (_null_rank, v)
             return (0, v)
 
         out.sort(key=keyfn, reverse=reverse)
@@ -2272,8 +2278,27 @@ def _build_having_q(
     """
     if not having:
         return None
-    valid_aliases = set(aggregate_aliases)
     q = Q()
+    for alias, comparison, value in parse_having(having, aggregate_aliases):
+        lookup = _HAVING_LOOKUP[comparison]
+        clause = Q(**{f"{alias}{lookup}": value})
+        if comparison in _HAVING_NEGATED:
+            clause = ~clause
+        q &= clause
+    return q
+
+
+def parse_having(
+    having: dict[str, Any], aggregate_aliases: Iterable[str],
+) -> list[tuple[str, str, Any]]:
+    """Validate a HAVING mapping into ``(alias, comparison, value)`` terms.
+
+    The single HAVING parser shared by the SQL path (:func:`_build_having_q`)
+    and the in-memory row path (``rows.compute_row_aggregation``). Unknown
+    aliases or comparisons raise :class:`HavingFieldNotAllowed`.
+    """
+    valid_aliases = set(aggregate_aliases)
+    terms: list[tuple[str, str, Any]] = []
     for key, value in having.items():
         alias, comparison = _split_having_key(key)
         if alias not in valid_aliases:
@@ -2286,12 +2311,8 @@ def _build_having_q(
                 f"Unknown HAVING comparison `{comparison}`. "
                 f"Allowed: {list(HAVING_COMPARISONS)}."
             )
-        lookup = _HAVING_LOOKUP[comparison]
-        clause = Q(**{f"{alias}{lookup}": value})
-        if comparison in _HAVING_NEGATED:
-            clause = ~clause
-        q &= clause
-    return q
+        terms.append((alias, comparison, value))
+    return terms
 
 
 def _split_having_key(key: str) -> tuple[str, str]:
@@ -2343,17 +2364,11 @@ def _build_order_terms(
     from strawberry_django_aggregates.ordering import (
         comodel_ordering_terms,
     )
-    valid = set(group_aliases) | set(aggregate_aliases)
+    validate_order_aliases(order_by, group_aliases, aggregate_aliases)
     group_alias_set = set(group_aliases)
     key_aliases = key_aliases or {}
     terms: list[Any] = []
     for alias, direction, nulls in order_by:
-        if alias not in valid:
-            raise OrderFieldNotAllowed(
-                f"Order term `{alias}` is not a valid aggregate alias "
-                f"({sorted(aggregate_aliases)}) nor group_by alias "
-                f"({sorted(group_aliases)})."
-            )
         nulls_first = True if nulls == "first" else None
         nulls_last = True if nulls == "last" else None
         expr = F(key_aliases.get(alias, alias))
@@ -2374,6 +2389,27 @@ def _build_order_terms(
             for extra in comodel_ordering_terms(model, alias):
                 terms.append(_term_to_expression(extra))
     return terms
+
+
+def validate_order_aliases(
+    order_by: list[tuple[str, str, str | None]],
+    group_aliases: list[str],
+    aggregate_aliases: list[str],
+) -> None:
+    """Fail loud on an order term outside the group/aggregate aliases.
+
+    Shared by the SQL path (:func:`_build_order_terms`) and the in-memory
+    row path (``rows.compute_row_aggregation``), so both namespaces and the
+    :class:`OrderFieldNotAllowed` message stay identical (Critical Rule 6).
+    """
+    valid = set(group_aliases) | set(aggregate_aliases)
+    for alias, _direction, _nulls in order_by:
+        if alias not in valid:
+            raise OrderFieldNotAllowed(
+                f"Order term `{alias}` is not a valid aggregate alias "
+                f"({sorted(aggregate_aliases)}) nor group_by alias "
+                f"({sorted(group_aliases)})."
+            )
 
 
 def _term_to_expression(term: str) -> Any:
