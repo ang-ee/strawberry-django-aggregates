@@ -40,6 +40,7 @@ from strawberry_django_aggregates.aliasing import (
 )
 from strawberry_django_aggregates.compiler import (
     HAVING_COMPARISONS,
+    aggregate_alias,
     bucket_range,
     compute_aggregation,
     resolve_field_to_one_only,
@@ -66,9 +67,11 @@ from strawberry_django_aggregates.pagination import (
     decode_group_cursor,
     encode_group_cursor,
 )
+from strawberry_django_aggregates.rows import is_row_model
 from strawberry_django_aggregates.types import (
     BucketRange,
     _choices_enum_for,
+    _resolve_group_by_fields,
     make_aggregate_type,
     make_group_by_spec,
     make_group_order_input,
@@ -273,6 +276,29 @@ class AggregateBuilder:
                 "enable_filter_echo=True; the hook only runs while "
                 "echoing a per-bucket filter (SPEC § 4.4).",
             )
+
+        # SPEC § 20: row-model rows are grouped in memory, which counts
+        # only. Refuse measures and JSON paths that executor cannot serve
+        # rather than advertise them in the schema.
+        if is_row_model(self.model):
+            if self.aggregate_fields or self.json_paths:
+                raise AggregateError(
+                    f"{self.model.__name__} is a row model: in-memory row "
+                    "aggregation counts only, so aggregate_fields must be "
+                    "empty and json_paths unset (SPEC § 20).",
+                )
+            # The only measure alias is ``count``; a column of that name
+            # would overwrite it in every result row. Refuse at build, not
+            # at the first grouped request.
+            count_alias = aggregate_alias(AggregateOp.COUNT, None)
+            if count_alias in _resolve_group_by_fields(
+                self.model, self.group_by_fields,
+            ):
+                raise AggregateError(
+                    f"{self.model.__name__} groups by a column named "
+                    f"{count_alias!r}, which collides with the count "
+                    "measure (SPEC § 20).",
+                )
 
         aggregate_type = make_aggregate_type(
             self.model,
@@ -1016,6 +1042,15 @@ class AggregateBuilder:
     def _resolve_queryset(self, info: Any) -> QuerySet:
         if self.get_queryset is not None:
             return self.get_queryset(info)
+        if self.model._meta.abstract:
+            # An abstract model — including a ``rows.make_row_model`` row
+            # model — has no table or manager. Row-model rows are grouped
+            # with ``compute_row_aggregation`` by the caller (SPEC § 20).
+            raise AggregateError(
+                f"{self.model.__name__} is an abstract model with no "
+                "queryset. Pass get_queryset, or group row-model rows "
+                "with compute_row_aggregation."
+            )
         return self.model._default_manager.all()
 
     def _a_fields(self) -> list[str]:

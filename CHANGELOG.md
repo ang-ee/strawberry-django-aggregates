@@ -5,6 +5,42 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.14.0] — 2026-10-05
+
+### Added
+
+- **Grouping computed rows.** `make_row_model(name, columns)` declares the
+  columns of non-table rows (str, int, float, Decimal, bool, date, datetime,
+  time, UUID or Enum) as an abstract Django model that is never registered.
+  Pass it to `AggregateBuilder(model=...)` for the usual group key, group-by
+  spec, HAVING and group-order types, translators and key shapers, unchanged.
+  `compute_row_aggregation(rows, *, model, ...)` groups mappings or objects in
+  memory and returns the same flat rows as `compute_aggregation`. NULL and
+  `""` stay distinct buckets, and enum members group by stored value.
+  Datetimes are read as Django reads a `DateTimeField`. Date axes convert to
+  `tz` before truncating. HAVING, ordering and paging follow the queryset
+  path. Values must match their declared column type, and colliding result
+  keys are refused. Measures are `count` only; a row model's builder emits no
+  other measures, and other operators raise `OperatorNotSupportedError`. See
+  `docs/SPEC.md` § 20.
+
+### Fixed
+
+- The in-memory group orderer keeps the requested null placement on
+  descending terms, as its documentation states. `desc` now puts NULLs
+  first, and `desc` with `nulls="last"` puts them last; both were inverted.
+  This changes `compute_aggregation(fill=True)` output ordered `desc` by a
+  non-count measure: zero-count filler buckets, whose other measures are
+  NULL, now come first unless `nulls="last"` is passed.
+
+### Changed
+
+- HAVING parsing and order-term validation each have one internal
+  implementation, shared by the SQL and in-memory paths. Errors and messages
+  are unchanged.
+- `AggregateBuilder` query fields over an abstract model without
+  `get_queryset` raise `AggregateError` instead of an `AttributeError`.
+
 ## [0.13.1] — 2026-10-03
 
 ### Fixed

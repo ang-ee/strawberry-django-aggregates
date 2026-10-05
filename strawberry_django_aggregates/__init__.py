@@ -11,6 +11,9 @@ Public surface:
 - :func:`make_group_by_spec` — generate the ``<Model>GroupBySpec`` input.
 - :func:`compute_aggregation` — backend primitive; returns flat
   composite-key result rows. Callable outside GraphQL.
+- :func:`make_row_model` + :func:`compute_row_aggregation` — declare
+  computed (non-table) row columns as an abstract model and group those
+  rows in memory with ``compute_aggregation`` semantics (SPEC § 20).
 - :func:`shape_aggregate_row` — fill a ``<Model>Aggregate`` from one
   ``compute_aggregation`` row (the selection-driven ``(op, field)`` pairs).
 - :meth:`AggregateBuilder.shape_group_key` — fill a typed
@@ -114,6 +117,10 @@ from strawberry_django_aggregates.pagination import (
 from strawberry_django_aggregates.relations import (
     register_relation_aggregate,
 )
+from strawberry_django_aggregates.rows import (
+    compute_row_aggregation,
+    make_row_model,
+)
 from strawberry_django_aggregates.types import (
     BigInt,
     BucketRange,
@@ -126,7 +133,7 @@ from strawberry_django_aggregates.types import (
     python_type_for_json,
 )
 
-__version__ = "0.13.1"
+__version__ = "0.14.0"
 
 __all__ = [
     # Builder (high-level)
@@ -141,6 +148,9 @@ __all__ = [
     # Backend primitives
     "compute_aggregation",
     "shape_aggregate_row",
+    # Computed rows — declare columns, group in memory (SPEC § 20)
+    "make_row_model",
+    "compute_row_aggregation",
     # Vocabularies
     "AggregateOp",
     "TimeGranularity",
