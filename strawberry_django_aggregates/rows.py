@@ -431,7 +431,8 @@ def _datetime_key(
     With ``USE_TZ`` a naive value is read in the default timezone. An
     unbucketed key is the UTC instant (what the database returns); a
     bucketed one converts to ``tzinfo`` BEFORE truncating (Critical Rule
-    5). Without ``USE_TZ`` values keep their own wall clock. TIME buckets
+    5). Without ``USE_TZ`` values must be naive and keep their wall clock;
+    an aware value is refused, as Django refuses to store one. TIME buckets
     reuse ``fill._floor`` — the Python ``date_trunc`` of the dense-fill
     spine — and resolve an ambiguous local time to its first occurrence.
     """
@@ -440,6 +441,11 @@ def _datetime_key(
             value = timezone.make_aware(value, timezone.get_default_timezone())
         value = value.astimezone(
             datetime.UTC if granularity is None else tzinfo,
+        )
+    elif timezone.is_aware(value):
+        raise AggregateError(
+            f"Row datetime {value!r} is timezone-aware while USE_TZ is "
+            "False; pass naive datetimes, as Django stores them."
         )
     if granularity is None:
         return value

@@ -30,8 +30,8 @@ The project follows [Semantic Versioning](https://semver.org/). During the
   descending terms, as its documentation states. `desc` now puts NULLs
   first, and `desc` with `nulls="last"` puts them last; both were inverted.
   This changes `compute_aggregation(fill=True)` output ordered `desc` by a
-  measure: zero-count filler buckets, whose measures are NULL, now come
-  first unless `nulls="last"` is passed.
+  non-count measure: zero-count filler buckets, whose other measures are
+  NULL, now come first unless `nulls="last"` is passed.
 
 ### Changed
 

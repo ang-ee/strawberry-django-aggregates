@@ -1613,9 +1613,10 @@ facts from `model._meta`, a row model is passed as `model=` unchanged.
 `translate_group_by` / `translate_having` / `translate_order_by` /
 `shape_group_key` work as documented in § 10. There is no parallel type
 emitter. A row model's measures default to none (the aggregate, HAVING and
-order inputs carry `count` only); a non-empty `aggregate_fields` or any
-`json_paths` raises `AggregateError` at build, because the row executor could
-not serve them. The builder's own query fields need a queryset: with a row
+order inputs carry `count` only); a non-empty `aggregate_fields`, any
+`json_paths`, or a group-by column named `count` (which would overwrite the
+measure) raises `AggregateError` at build, because the row executor could not
+serve them. The builder's own query fields need a queryset: with a row
 model and no `get_queryset` they raise `AggregateError` naming
 `compute_row_aggregation`.
 
@@ -1643,7 +1644,9 @@ raises `AggregateError` naming the column. Rows are permission-naive input
   `USE_TZ`, a naive value is in the default timezone, an unbucketed key is
   the UTC instant (what the database returns), and a bucketed axis converts
   to `tz` (default `settings.TIME_ZONE`) *before* truncation (Critical
-  Rule 5); without `USE_TZ`, values keep their own wall clock. TIME buckets
+  Rule 5); without `USE_TZ`, values must be naive (an aware value raises
+  `AggregateError`, as Django refuses to store one) and keep their wall
+  clock. TIME buckets
   reuse the dense-fill spine's Python `date_trunc` (§ 7.2), label an
   ambiguous local time with its first occurrence, and keep the input kind (a
   `date` buckets to a `date`, as `Trunc` does for a `DateField`). NUMBER

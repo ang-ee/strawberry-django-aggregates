@@ -260,6 +260,16 @@ def test_row_model_builder_counts_only():
             ).build()
 
 
+@pytest.mark.parametrize("group_by_fields", [["count"], None])
+def test_row_model_builder_refuses_a_count_column(group_by_fields):
+    model = make_row_model("Tallies", {"label": str, "count": int})
+
+    with pytest.raises(AggregateError, match="count"):
+        AggregateBuilder(
+            model=model, group_by_fields=group_by_fields,
+        ).build()
+
+
 # --- execution parity with compute_aggregation
 
 
@@ -649,6 +659,17 @@ def test_without_use_tz_values_keep_their_wall_clock(settings):
     )[0]["at_day"]
 
     assert day == datetime.datetime(2026, 5, 11)
+
+
+def test_without_use_tz_aware_values_are_refused(settings):
+    settings.USE_TZ = False
+    rows = [{"at": datetime.datetime(2026, 5, 11, 3, tzinfo=datetime.UTC)}]
+
+    with pytest.raises(AggregateError, match="USE_TZ"):
+        compute_row_aggregation(
+            rows, model=_when_model(), aggregates=COUNT,
+            group_by=[("at", None)],
+        )
 
 
 def test_unbucketed_datetimes_group_by_utc_instant():
