@@ -24,6 +24,7 @@ from strawberry_django_aggregates.granularity import (
 
 if TYPE_CHECKING:
     from django.db.models.fields import Field
+    from django.db.models.fields.reverse_related import ForeignObjectRel
 
 
 def json_path_alias(field_path: str) -> str:
@@ -50,7 +51,7 @@ def group_by_enum_member(field_path: str) -> str:
 def group_by_alias(
     field_path: str,
     granularity: Granularity | None,
-    field: Field | None = None,
+    field: Field | ForeignObjectRel | None = None,
 ) -> str:
     """Canonical output alias for a (field, granularity) pair.
 
