@@ -5,6 +5,13 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.14.1] — 2026-11-07
+
+### Fixed
+
+- Group aliases accept native reverse relation metadata (`codex/native-model-typing`, 0f374854), the
+  revision the Angee framework has consumed since 2026-10-21.
+
 ## [0.14.0] — 2026-10-05
 
 ### Added
