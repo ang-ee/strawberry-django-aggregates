@@ -44,6 +44,18 @@ def test_fk_axis_gets_id_suffix():
     assert group_by_alias("customer", None, fk) == "customer_id"
 
 
+def test_reverse_one_to_one_axis_keeps_bare_alias():
+    """Reverse to-one relation metadata keeps its canonical unsuffixed key."""
+    from django.db.models.fields.reverse_related import OneToOneRel
+
+    from tests.models import Customer
+
+    reverse = Customer._meta.get_field("profile")
+    assert isinstance(reverse, OneToOneRel)
+    assert reverse.is_relation and not reverse.many_to_one
+    assert group_by_alias("profile", None, reverse) == "profile"
+
+
 def test_plain_field_passes_through():
     """A non-relation field with no granularity → the path verbatim."""
     from tests.models import Order
