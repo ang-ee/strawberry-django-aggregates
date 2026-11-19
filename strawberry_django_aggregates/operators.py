@@ -143,12 +143,41 @@ def default_operators_for_json_type(
     return ()
 
 
+_STRING_TYPES: frozenset[str] = frozenset({
+    "CharField", "TextField", "EmailField", "URLField", "SlugField",
+})
+"""The string field types, which :func:`field_type_for` keeps by name."""
+
+
+def field_type_for(field: object) -> str:
+    """Return the Django field type ``field`` is aggregated as (SPEC § 5).
+
+    It is the type Django says the column stores,
+    ``field.get_internal_type()``, so a subclass of a temporal, numeric,
+    boolean or id field aggregates as that field (its GraphQL type, its
+    date buckets, its SUM and AVG types and its default operators) and a
+    ``GeneratedField`` as its ``output_field``. A string type is the one
+    exception: it stays the exact class name, so a subclass of a text
+    field (one that seals or encodes what it stores, say) gains no default
+    string operator and opts in through ``operators=``, while Django's own
+    ``EmailField`` and ``URLField`` keep theirs. An object that states no
+    internal type (a ``GenericForeignKey``) is its class name.
+    """
+    name = type(field).__name__
+    internal = getattr(field, "get_internal_type", None)
+    if internal is None:
+        return name
+    stored = str(internal())
+    return name if stored in _STRING_TYPES else stored
+
+
 def default_operators_for(field_type: str) -> tuple[AggregateOp, ...]:
     """Return the default operator allowlist for a Django field type name.
 
-    ``field_type`` is the Django field class name as a string (e.g.
-    ``"IntegerField"``). Used by :class:`AggregateBuilder` when the
-    consumer doesn't specify per-field overrides.
+    ``field_type`` is the type a field is aggregated as, as a string (e.g.
+    ``"IntegerField"``; :func:`field_type_for` answers it for a field).
+    Used by :class:`AggregateBuilder` when the consumer doesn't specify
+    per-field overrides.
 
     Unknown field types return an empty tuple — explicit allowlisting
     required.
@@ -163,9 +192,7 @@ def default_operators_for(field_type: str) -> tuple[AggregateOp, ...]:
         return _DATE_OPS
     if field_type == "BooleanField":
         return _BOOL_OPS
-    if field_type in {
-        "CharField", "TextField", "EmailField", "URLField", "SlugField",
-    }:
+    if field_type in _STRING_TYPES:
         return _STRING_OPS
     if field_type in {"UUIDField", "AutoField", "BigAutoField"}:
         return _ID_OPS
