@@ -36,3 +36,13 @@ Any change that affects type generation must preserve deterministic SDL:
 
 See `CLAUDE.md` Critical Rule 2 and `docs/SPEC.md` § 12 for the full
 determinism contract.
+
+## Golden SDL
+
+`tests/test_builtin_sdl.py` pins the group key and measure types of the test
+models whose fields are all Django built-ins against
+`tests/golden/builtin_fields.graphql`. Regenerate it with
+`uv run python tests/golden_sdl.py`, from a checkout of `v0.14.1` with the
+current `tests/` copied in, unless this library means to change those fields.
+A diff after a dependency bump is the SDL printer's formatting: check it against
+`v0.14.1`'s semantics before accepting it.
