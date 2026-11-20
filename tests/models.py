@@ -8,6 +8,8 @@ across `items__price` (would silently row-multiply).
 
 from __future__ import annotations
 
+import enum
+
 from django.db import models
 
 
@@ -128,25 +130,165 @@ class SealedTextField(models.TextField):
     """A ``TextField`` whose stored text no default operator may expose."""
 
 
-class Reading(models.Model):
-    """Field subclasses aggregate as the Django field type they store.
+class LoggedAtField(models.DateTimeField):
+    """A ``DateTimeField`` that converts what it reads (``to_python``)."""
 
-    SPEC § 5 (per-field-type defaults) and § 7 (date buckets): a subclass
-    of a temporal, numeric, boolean or id field, and a ``GeneratedField``
-    by its ``output_field``, take that type's GraphQL type, buckets and
-    default operators; a subclass of a string field keeps no default
-    string operator until the caller allows it.
+    def to_python(self, value):
+        return super().to_python(value)
+
+
+class Reading(models.Model):
+    """Field subclasses and the type they aggregate as (SPEC § 5, § 7).
+
+    ``stamped_at`` and ``amount`` subclass a temporal and a numeric field
+    and return its values: they aggregate as ``DateTimeField`` and
+    ``DecimalField``. ``logged_at`` converts its values, ``note``
+    subclasses a text field and ``mirrored_at`` is generated: each keeps
+    its class name.
     """
 
     taken_at    = models.DateTimeField()
     stamped_at  = StampField()
     amount      = AmountField(max_digits=10, decimal_places=2)
     note        = SealedTextField(blank=True, default="")
+    logged_at   = LoggedAtField(null=True)
     mirrored_at = models.GeneratedField(
         expression=models.F("taken_at"),
         output_field=models.DateTimeField(),
         db_persist=True,
     )
+
+    class Meta:
+        app_label = "tests"
+
+
+class Color(enum.Enum):
+    RED = 1
+    BLUE = 2
+
+
+class Token:
+    """An opaque public id wrapping a sequential integer."""
+
+    def __init__(self, number: int) -> None:
+        self.number = number
+
+    def __str__(self) -> str:
+        return f"tok_{self.number * 7919:x}"
+
+    def __int__(self) -> int:
+        return self.number
+
+    def __hash__(self) -> int:
+        return hash(self.number)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Token) and other.number == self.number
+
+
+class EnumIntegerField(models.IntegerField):
+    """An ``IntegerField`` whose Python value is an enum member."""
+
+    def from_db_value(self, value, expression, connection):
+        return None if value is None else Color(value)
+
+    def get_prep_value(self, value):
+        return value.value if isinstance(value, Color) else value
+
+
+class OpaqueIdField(models.IntegerField):
+    """An ``IntegerField`` whose Python value is an opaque token."""
+
+    def from_db_value(self, value, expression, connection):
+        return None if value is None else Token(value)
+
+    def get_prep_value(self, value):
+        return value.number if isinstance(value, Token) else value
+
+
+class TokenUUIDField(models.UUIDField):
+    """A ``UUIDField`` whose Python value is a prefixed token."""
+
+    def from_db_value(self, value, expression, connection):
+        return None if value is None else f"tok_{value}"
+
+
+class UnitField(models.IntegerField):
+    """An ``IntegerField`` that returns the integers it stores."""
+
+
+class Ledger(models.Model):
+    """Value-converting subclasses keep their name; a plain one inherits."""
+
+    color = EnumIntegerField()
+    ref   = OpaqueIdField()
+    token = TokenUUIDField(null=True)
+    units = UnitField(default=0)
+
+    class Meta:
+        app_label = "tests"
+
+
+class ElapsedField(models.DurationField):
+    """A ``DurationField`` subclass: no type is inherited from a duration."""
+
+
+class Span(models.Model):
+    """Duration columns that build as before: a subclass, a generated one."""
+
+    start  = models.DateTimeField()
+    end    = models.DateTimeField()
+    lap    = ElapsedField(null=True)
+    length = models.GeneratedField(
+        expression=models.F("end") - models.F("start"),
+        output_field=models.DurationField(),
+        db_persist=True,
+    )
+
+    class Meta:
+        app_label = "tests"
+
+
+class Shelf(models.Model):
+    name = models.CharField(max_length=20)
+
+    class Meta:
+        app_label = "tests"
+
+
+class Volume(models.Model):
+    """``order_with_respect_to`` adds Django's own ``_order`` column."""
+
+    shelf = models.ForeignKey(Shelf, on_delete=models.CASCADE)
+    title = models.CharField(max_length=20)
+    pages = models.IntegerField(default=0)
+
+    class Meta:
+        app_label = "tests"
+        order_with_respect_to = "shelf"
+
+
+class TaggedEmailField(models.EmailField):
+    pass
+
+
+class TaggedURLField(models.URLField):
+    pass
+
+
+class TaggedSlugField(models.SlugField):
+    pass
+
+
+class Contact(models.Model):
+    """Django's string fields keep their operators; their subclasses none."""
+
+    email        = models.EmailField(default="")
+    url          = models.URLField(default="")
+    slug         = models.SlugField(default="")
+    tagged_email = TaggedEmailField(default="")
+    tagged_url   = TaggedURLField(default="")
+    tagged_slug  = TaggedSlugField(default="")
 
     class Meta:
         app_label = "tests"

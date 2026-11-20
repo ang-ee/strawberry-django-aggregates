@@ -113,3 +113,28 @@ def test_filter_echo_on_is_byte_identical_and_emits_field(db):
         f"echo SDL non-deterministic:\n{_diff(sdl_1, sdl_2)}"
     )
     assert "filter: JSON!" in sdl_1
+
+
+def _build_default_schema(model):
+    """One model's schema with the builder's defaults (no allowlists)."""
+    built = AggregateBuilder(model=model).build()
+
+    @strawberry.type
+    class Query:
+        aggregate: built.aggregate_type = built.aggregate_field
+        grouped:   built.grouped_result_type = built.group_by_field
+
+    return strawberry.Schema(query=Query).as_str()
+
+
+def test_field_kinds_emit_byte_identical_schemas_across_runs(db):
+    """Inherited types, buckets and defaults (SPEC § 5) are deterministic."""
+    from tests.models import Contact, Ledger, Reading, Span, Volume
+
+    for model in (Reading, Ledger, Span, Volume, Contact):
+        sdl_1 = _build_default_schema(model)
+        sdl_2 = _build_default_schema(model)
+        assert sdl_1 == sdl_2, (
+            f"{model.__name__} SDL non-deterministic:\n{_diff(sdl_1, sdl_2)}"
+        )
+        assert "stampedAtMonth" in sdl_1 or model is not Reading

@@ -9,6 +9,9 @@ accepted; consumers cannot pass arbitrary SQL fragments.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any, NamedTuple
+
+from django.db import models
 
 
 class AggregateOp(StrEnum):
@@ -146,35 +149,90 @@ def default_operators_for_json_type(
 _STRING_TYPES: frozenset[str] = frozenset({
     "CharField", "TextField", "EmailField", "URLField", "SlugField",
 })
-"""The string field types, which :func:`field_type_for` keeps by name."""
+"""The string field types; each has the string default operators."""
+
+_STORED_TYPES: tuple[type[models.Field[Any, Any]], ...] = (
+    models.DateTimeField, models.DateField, models.TimeField,
+    models.DecimalField, models.FloatField,
+    models.PositiveBigIntegerField, models.PositiveSmallIntegerField,
+    models.PositiveIntegerField, models.SmallIntegerField,
+    models.BigIntegerField, models.IntegerField,
+)
+"""The temporal and numeric Django field types a subclass may aggregate as.
+
+Most specific first, so the first a field is an instance of is the type
+its column holds. ``DurationField`` is not among them: it has no GraphQL
+scalar here (SPEC § 5).
+"""
+
+_VALUE_HOOKS: tuple[str, ...] = (
+    "db_type", "from_db_value", "get_db_converters", "to_python",
+)
+"""How a field stores its value and turns it back into a Python value."""
+
+
+class FieldKind(NamedTuple):
+    """What a field is to this library (SPEC § 5): one answer for both sides.
+
+    ``stored`` is the temporal or numeric Django field type the field is an
+    instance of, ``None`` when it is none: the compiler reads it to decide
+    what SQL the column admits (date truncation, the time zone wrap, an
+    integer sum widened to ``bigint``). ``name`` is the type the field
+    aggregates as: the schema reads it for the GraphQL type, the date
+    buckets, the SUM and AVG types and the default operators. ``name`` is
+    ``stored`` only where the field returns the stored type's values
+    (:func:`field_kind`); otherwise it is the field's class name.
+    """
+
+    stored: str | None
+    name: str
+
+
+def field_kind(field: object) -> FieldKind:
+    """Return what ``field`` is, for the schema and the compiler alike.
+
+    A Django temporal or numeric field (``DateTimeField``, ``DateField``,
+    ``TimeField``, ``DecimalField``, ``FloatField``, the integer types) is
+    that type. A subclass of one aggregates as that type when it stores and
+    returns the same values: its class is not one of Django's own
+    (``OrderWrt``, the auto primary keys), its ``get_internal_type()``
+    names that type, and it overrides none of ``db_type``,
+    ``from_db_value``, ``get_db_converters`` and ``to_python`` relative to
+    that type. A created-time field on ``DateTimeField`` or a money field on
+    ``DecimalField`` is such a subclass. A subclass that returns other
+    values (an enum member, an opaque token) keeps its class name: no
+    inherited type, buckets or default operators; it opts in through
+    ``operators=``. Any other field is its class name: a string or duration
+    field and its subclasses, a ``GeneratedField`` of any output, a
+    relation and a reverse relation.
+    """
+    cls = type(field)
+    base = next((t for t in _STORED_TYPES if isinstance(field, t)), None)
+    if base is None:
+        return FieldKind(None, cls.__name__)
+    stored = base.__name__
+    internal = getattr(field, "get_internal_type", None)
+    inherits = cls is base or (
+        cls.__module__.partition(".")[0] != "django"
+        and internal is not None
+        and internal() == stored
+        and all(
+            getattr(cls, hook, None) is getattr(base, hook, None)
+            for hook in _VALUE_HOOKS
+        )
+    )
+    return FieldKind(stored, stored if inherits else cls.__name__)
 
 
 def field_type_for(field: object) -> str:
-    """Return the Django field type ``field`` is aggregated as (SPEC § 5).
-
-    It is the type Django says the column stores,
-    ``field.get_internal_type()``, so a subclass of a temporal, numeric,
-    boolean or id field aggregates as that field (its GraphQL type, its
-    date buckets, its SUM and AVG types and its default operators) and a
-    ``GeneratedField`` as its ``output_field``. A string type is the one
-    exception: it stays the exact class name, so a subclass of a text
-    field (one that seals or encodes what it stores, say) gains no default
-    string operator and opts in through ``operators=``, while Django's own
-    ``EmailField`` and ``URLField`` keep theirs. An object that states no
-    internal type (a ``GenericForeignKey``) is its class name.
-    """
-    name = type(field).__name__
-    internal = getattr(field, "get_internal_type", None)
-    if internal is None:
-        return name
-    stored = str(internal())
-    return name if stored in _STRING_TYPES else stored
+    """Return the type ``field`` aggregates as: :func:`field_kind`'s name."""
+    return field_kind(field).name
 
 
 def default_operators_for(field_type: str) -> tuple[AggregateOp, ...]:
     """Return the default operator allowlist for a Django field type name.
 
-    ``field_type`` is the type a field is aggregated as, as a string (e.g.
+    ``field_type`` is the type a field aggregates as, as a string (e.g.
     ``"IntegerField"``; :func:`field_type_for` answers it for a field).
     Used by :class:`AggregateBuilder` when the consumer doesn't specify
     per-field overrides.

@@ -62,7 +62,7 @@ from strawberry_django_aggregates.granularity import (
     TimeGranularity,
     validate_week_start,
 )
-from strawberry_django_aggregates.operators import AggregateOp
+from strawberry_django_aggregates.operators import AggregateOp, field_kind
 
 if TYPE_CHECKING:
     from django.db.models import Field, Model
@@ -341,8 +341,9 @@ def _resolve_row_axis(
             f"`{model.__name__}` is a {type(field).__name__}."
         )
     if granularity is not None:
-        is_date = isinstance(field, models.DateField)
-        is_datetime = isinstance(field, models.DateTimeField)
+        stored = field_kind(field).stored
+        is_date = stored in {"DateField", "DateTimeField"}
+        is_datetime = stored == "DateTimeField"
         if not is_date or (
             not is_datetime and granularity in _TIME_OF_DAY
         ):
@@ -471,9 +472,10 @@ def _axis_key(
 ) -> Any:
     if value is None:
         return None
-    if isinstance(axis.field, models.DateTimeField):
+    stored = field_kind(axis.field).stored
+    if stored == "DateTimeField":
         return _datetime_key(value, axis.granularity, tzinfo, week_start)
-    if isinstance(axis.field, models.DateField):
+    if stored == "DateField":
         return _date_key(value, axis.granularity, week_start)
     return value
 

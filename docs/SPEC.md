@@ -473,23 +473,38 @@ Field types map to default operator allowlists. Consumers can narrow further via
 
 `count` and `count_distinct` are always present at the type level (operate on rows, not on a measure).
 
-**Which type a field is.** A field counts as the Django field type it stores,
-`field.get_internal_type()` (`field_type_for(field)`), for every decision this
-library makes about it: the default operators above, the result types of
-`sum`, `avg`, `min`, `max`, `mode` and `array_agg` (§ 5's table), its type on
-`<Model>GroupKey`, and its date buckets (§ 7). So a subclass of a Django field,
-which keeps its column, its SQL and its Python values, aggregates as that field
-(a `DateTimeField` subclass gets the `DateTimeField` row, a `DecimalField`
-subclass `Decimal` sums and averages), and a `GeneratedField` aggregates as its
-`output_field`. **String types are the one exception:** a field Django stores as
-one of the string types in the table keeps its exact class name, so a subclass
-of a text field (one that seals or encodes what it stores, say) gets no default
-operator and the caller opts it in through `operators=`; Django's own
-`EmailField`, `URLField` and `SlugField` keep their row. Defaults are
-explicit allowlisting: inheriting a datetime's or a decimal's operators is the
-same SQL on the same column, while widening string defaults silently would
-expose stored text. A subclass of an integer field that stores a code inherits
-the numeric defaults; narrow it with `operators=`.
+**Which type a field is.** One owner, `field_kind(field)` in
+`operators.py`, answers what a field is, for the schema and the compiler
+alike. It returns `stored`, the Django temporal or numeric type the field is an
+instance of (`DateTimeField`, `DateField`, `TimeField`, `DecimalField`,
+`FloatField`, the integer types; `None` for any other field), and `name`, the
+type the field aggregates as (`field_type_for(field)`). The compiler reads
+`stored` to decide what SQL a column admits: a granularity applies to a stored
+date, datetime or time column, the time zone wrap to a stored datetime, and an
+integer sum across a relation widens to `bigint`. The schema reads `name` for
+the default operators above, the result types of `sum`, `avg`, `min`, `max`,
+`mode` and `array_agg`, the type on `<Model>GroupKey`, and the date buckets
+(§ 7). `name` is `stored` only where the field stores and returns the stored
+type's values, so no bucket is advertised that a query is refused:
+
+- a Django temporal or numeric field is its own type;
+- a subclass of one aggregates as that type when its class is not one of
+  Django's own (`OrderWrt`, the auto primary keys keep their own names), its
+  `get_internal_type()` names that type, and it overrides none of `db_type`,
+  `from_db_value`, `get_db_converters` and `to_python` relative to that type
+  (a created-time field on `DateTimeField`, a money field on `DecimalField`);
+- every other field is its class name, as before: a subclass that converts the
+  values it reads (an enum member, an opaque token) or stores them otherwise;
+  a string, UUID, boolean, duration, relation or id field and every subclass of
+  one, so a subclass of a text field gets no default string operator while
+  `EmailField`, `URLField` and `SlugField` keep their row; a `GeneratedField`
+  of any output, which therefore has no date buckets; a reverse relation.
+
+A field that is its class name has no inherited type, buckets or default
+operators; the caller opts it in through `operators=`. `DurationField` and its
+subclasses are not inherited: no GraphQL scalar carries a duration here (a plain
+`DurationField` in the default allowlist fails schema construction; see the
+changelog's known issues).
 
 **JSON-path declared types.** Stream 17 introduces a parallel table for
 typed dotted paths on `JSONField` columns. See § 6.1 for the wire format
@@ -1007,10 +1022,11 @@ class NumberGranularity(StrEnum):
 
 The NUMBER track is the canonical way to ask "orders per day-of-week" or "signups per hour-of-day across all dates" (cohort/heatmap analytics). Odoo learned this in 17.3 (PR #159528) and we ship it day-1.
 
-Both tracks apply to every group-by field Django stores as a `DateField` or
-`DateTimeField` (§ 5, "Which type a field is"): a subclass of either and a
-`GeneratedField` whose `output_field` is one get the per-granularity bucket keys
-on `<Model>GroupKey` and their `_range` siblings like the field itself.
+Both tracks apply to every group-by field that aggregates as a `DateField` or
+`DateTimeField` (§ 5, "Which type a field is"): a subclass of either that
+returns its values gets the per-granularity bucket keys on `<Model>GroupKey`
+and their `_range` siblings like the field itself. A `GeneratedField` gets none,
+whatever its output, and the compiler refuses a granularity on it alike.
 
 ### Bucket range siblings — `<field>_<granularity>_range`
 
