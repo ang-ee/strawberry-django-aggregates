@@ -71,7 +71,7 @@ from strawberry_django_aggregates.granularity import (
     TimeGranularity,
     validate_week_start,
 )
-from strawberry_django_aggregates.operators import AggregateOp, field_kind
+from strawberry_django_aggregates.operators import AggregateOp, _field_kind
 
 if TYPE_CHECKING:
     from django.db.models import Model, QuerySet
@@ -108,7 +108,7 @@ HAVING_COMPARISONS: tuple[str, ...] = (
 _TEMPORAL_TYPES: frozenset[str] = frozenset({
     "DateField", "DateTimeField", "TimeField",
 })
-"""Stored types a granularity applies to (``field_kind(...).stored``)."""
+"""Stored types a granularity applies to (``_field_kind(...).stored``)."""
 
 _NARROW_INTEGER_TYPES: frozenset[str] = frozenset({
     "IntegerField", "SmallIntegerField",
@@ -1620,7 +1620,7 @@ def _build_group_by_expression(
     if granularity is None:
         return source
 
-    stored = field_kind(field).stored
+    stored = _field_kind(field).stored
     if stored not in _TEMPORAL_TYPES:
         raise GranularityNotApplicable(
             f"Granularity {granularity!r} cannot apply to field "
@@ -1679,7 +1679,7 @@ def _trunc_week_shifted(
     delta = datetime.timedelta(days=offset)
     out_field: Any = (
         DateTimeField()
-        if field_kind(field).stored == "DateTimeField"
+        if _field_kind(field).stored == "DateTimeField"
         else DateField()
     )
     shifted_in = ExpressionWrapper(
@@ -2011,7 +2011,7 @@ def _output_field_for_traversal(
     # are unaffected.
     if op is AggregateOp.SUM and inner is not None:
         from django.db.models import BigIntegerField
-        if field_kind(inner).stored in _NARROW_INTEGER_TYPES:
+        if _field_kind(inner).stored in _NARROW_INTEGER_TYPES:
             return BigIntegerField()
     return inner
 

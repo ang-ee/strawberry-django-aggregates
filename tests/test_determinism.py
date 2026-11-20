@@ -129,9 +129,18 @@ def _build_default_schema(model):
 
 def test_field_kinds_emit_byte_identical_schemas_across_runs(db):
     """Inherited types, buckets and defaults (SPEC § 5) are deterministic."""
-    from tests.models import Contact, Ledger, Reading, Span, Volume
+    from tests.models import (
+        BuiltinFields,
+        Contact,
+        Gauge,
+        Ledger,
+        Reading,
+        Span,
+        Volume,
+    )
 
-    for model in (Reading, Ledger, Span, Volume, Contact):
+    models = (Reading, Ledger, Span, Volume, Contact, Gauge, BuiltinFields)
+    for model in models:
         sdl_1 = _build_default_schema(model)
         sdl_2 = _build_default_schema(model)
         assert sdl_1 == sdl_2, (

@@ -70,6 +70,21 @@ NUMBER_GRANULARITY_PART: dict[NumberGranularity, str] = {
 Granularity = TimeGranularity | NumberGranularity
 """Either kind of granularity — used in spec inputs."""
 
+_TIME_OF_DAY: frozenset[Granularity] = frozenset({
+    TimeGranularity.HOUR,
+    TimeGranularity.MINUTE,
+    TimeGranularity.SECOND,
+    NumberGranularity.HOUR_NUMBER,
+    NumberGranularity.MINUTE_NUMBER,
+    NumberGranularity.SECOND_NUMBER,
+})
+"""Granularities of the time of day, which have no meaning on a date.
+
+The row path refuses them on a date column, and a date-only subclass gets
+no bucket of them (SPEC § 7). A plain ``DateField``'s group key still
+advertises them, and a query of one fails (a known issue).
+"""
+
 
 def validate_week_start(value: int) -> int:
     """Validate a locale-aware ``week_start`` parameter.

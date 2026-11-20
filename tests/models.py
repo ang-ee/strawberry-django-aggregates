@@ -292,3 +292,104 @@ class Contact(models.Model):
 
     class Meta:
         app_label = "tests"
+
+
+class SelectFormatField(models.IntegerField):
+    """An ``IntegerField`` that changes the SQL it selects."""
+
+    def select_format(self, compiler, sql, params):
+        return f"({sql} * 2)", params
+
+
+class TextColumnField(models.IntegerField):
+    """An ``IntegerField`` whose column is text (``db_parameters``)."""
+
+    def db_parameters(self, connection):
+        return {"type": "text", "check": None}
+
+
+class InstanceHookField(models.IntegerField):
+    """An ``IntegerField`` converting its values through an instance hook."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.from_db_value = lambda value, expression, connection: (
+            None if value is None else Token(value)
+        )
+
+
+class UnwrappingDecimalField(models.DecimalField):
+    """Overrides only ``to_python``, as django-money's ``MoneyField`` does."""
+
+    def to_python(self, value):
+        if isinstance(value, tuple):
+            value = value[0]
+        return super().to_python(value)
+
+
+class DayField(models.DateField):
+    """A ``DateField`` that returns the dates it stores."""
+
+
+class Gauge(models.Model):
+    """Further routes to other values, and a date-only subclass."""
+
+    doubled   = SelectFormatField(default=0)
+    as_text   = TextColumnField(default=0)
+    hooked    = InstanceHookField(default=0)
+    unwrapped = UnwrappingDecimalField(
+        max_digits=9, decimal_places=2, default=0,
+    )
+    day       = models.DateField(null=True)
+    sub_day   = DayField(null=True)
+    total     = models.GeneratedField(
+        expression=models.F("unwrapped") * 2,
+        output_field=models.DecimalField(max_digits=12, decimal_places=2),
+        db_persist=True,
+    )
+
+    class Meta:
+        app_label = "tests"
+
+
+class BuiltinFields(models.Model):
+    """One of each Django built-in field that builds a schema (SPEC § 5).
+
+    Its SDL is pinned against the golden file ``tests/golden_sdl.py``
+    writes: a built-in field answers by its own type, as it always did.
+    ``DurationField`` is left out: its default allowlist fails schema
+    construction (a known issue).
+    """
+
+    big_int   = models.BigIntegerField(default=0)
+    binary    = models.BinaryField(default=b"")
+    boolean   = models.BooleanField(default=False)
+    char      = models.CharField(max_length=5, default="")
+    date      = models.DateField(null=True)
+    moment    = models.DateTimeField(null=True)
+    dec       = models.DecimalField(max_digits=9, decimal_places=2, default=0)
+    email     = models.EmailField(default="")
+    path      = models.FilePathField(default="")
+    flt       = models.FloatField(default=0)
+    ip        = models.GenericIPAddressField(null=True)
+    integer   = models.IntegerField(default=0)
+    pos_big   = models.PositiveBigIntegerField(default=0)
+    pos_int   = models.PositiveIntegerField(default=0)
+    pos_small = models.PositiveSmallIntegerField(default=0)
+    slug      = models.SlugField(default="")
+    small     = models.SmallIntegerField(default=0)
+    text      = models.TextField(default="")
+    time      = models.TimeField(null=True)
+    url       = models.URLField(default="")
+    uuid      = models.UUIDField(null=True)
+    file      = models.FileField(null=True)
+    json      = models.JSONField(default=dict)
+    shelf     = models.ForeignKey(
+        Shelf, on_delete=models.CASCADE, null=True, related_name="+",
+    )
+    choice    = models.IntegerField(
+        choices=[(1, "One"), (2, "Two")], default=1,
+    )
+
+    class Meta:
+        app_label = "tests"
