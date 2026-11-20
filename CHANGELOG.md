@@ -26,11 +26,14 @@ version's files can never be uploaded again, so nothing is published as 0.14.2.
     datetime key from `"2026-04-03 12:00:00+00:00"` to the ISO form
     `"2026-04-03T12:00:00+00:00"`, an integer key from `"3"` to `3`, a float
     key from `"1.5"` to `1.5`;
-  - measures a caller had already allowed through `operators=` are retyped
-    too: `sum` and `min`/`max` go from `String` to `Decimal`, `BigInt` or `Int`
-    (an integer `min` on the wire from `"3"` to `3`), `avg` of a decimal
-    subclass from `Float` to `Decimal` (on the wire from `3.75` to `"3.75"`),
-    `max` of a datetime subclass from `String` to `DateTime` (the ISO form);
+  - each measure a caller had already allowed through `operators=` takes the
+    scalar of the field's base type, as that type's own measures do (§ 5's
+    table): `sum` and `min`/`max` go from `String` to `Decimal`, `BigInt`,
+    `Int` or `Float` (an integer `min` on the wire from `"3"` to `3`, a float
+    one from `"1.5"` to `1.5`), `min`/`max` of a date, time or datetime
+    subclass from `String` to `Date`, `Time` or `DateTime` (a datetime in the
+    ISO form), and `avg` of a decimal subclass from `Float` to `Decimal` (on the
+    wire from `3.75` to `"3.75"`);
   - the HAVING inputs follow (here for fields `amount`, `units` and `stamp`):
     `sumAmountGt: String` becomes `Decimal`,
     `sumUnitsGt: String` becomes `BigInt`, `minUnitsGt: String` becomes `Int`,
@@ -43,7 +46,8 @@ version's files can never be uploaded again, so nothing is published as 0.14.2.
   - a datetime subclass with `choices` loses its group key's enum type: the key
     becomes `DateTime`;
   - a foreign key whose `to_field` is such a subclass retypes its `Id` key from
-    `String` to `Int`.
+    `String` to its target's scalar (`Int` for an integer subclass, `Date` for a
+    date one).
   Every other field answers as on 0.14.1, Django's own built-ins byte for byte
   (`tests/golden_sdl.py`).
 
