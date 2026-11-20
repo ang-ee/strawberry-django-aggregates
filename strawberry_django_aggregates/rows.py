@@ -57,12 +57,13 @@ from strawberry_django_aggregates.errors import (
 )
 from strawberry_django_aggregates.fill import _floor
 from strawberry_django_aggregates.granularity import (
+    _TIME_OF_DAY,
     Granularity,
     NumberGranularity,
     TimeGranularity,
     validate_week_start,
 )
-from strawberry_django_aggregates.operators import AggregateOp
+from strawberry_django_aggregates.operators import AggregateOp, _field_kind
 
 if TYPE_CHECKING:
     from django.db.models import Field, Model
@@ -91,17 +92,6 @@ _COLUMN_FIELDS: dict[type, type[Field]] = {
     uuid.UUID:         models.UUIDField,
 }
 
-# Time-of-day granularities have no meaning on a calendar date. The SQL
-# path refuses them on a ``DateField`` too (Django cannot truncate or
-# extract a time component from a date column).
-_TIME_OF_DAY: frozenset[Granularity] = frozenset({
-    TimeGranularity.HOUR,
-    TimeGranularity.MINUTE,
-    TimeGranularity.SECOND,
-    NumberGranularity.HOUR_NUMBER,
-    NumberGranularity.MINUTE_NUMBER,
-    NumberGranularity.SECOND_NUMBER,
-})
 
 
 def is_row_model(model: Any) -> bool:
@@ -341,8 +331,9 @@ def _resolve_row_axis(
             f"`{model.__name__}` is a {type(field).__name__}."
         )
     if granularity is not None:
-        is_date = isinstance(field, models.DateField)
-        is_datetime = isinstance(field, models.DateTimeField)
+        stored = _field_kind(field).stored
+        is_date = stored in {"DateField", "DateTimeField"}
+        is_datetime = stored == "DateTimeField"
         if not is_date or (
             not is_datetime and granularity in _TIME_OF_DAY
         ):
@@ -471,9 +462,10 @@ def _axis_key(
 ) -> Any:
     if value is None:
         return None
-    if isinstance(axis.field, models.DateTimeField):
+    stored = _field_kind(axis.field).stored
+    if stored == "DateTimeField":
         return _datetime_key(value, axis.granularity, tzinfo, week_start)
-    if isinstance(axis.field, models.DateField):
+    if stored == "DateField":
         return _date_key(value, axis.granularity, week_start)
     return value
 

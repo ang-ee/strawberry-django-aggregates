@@ -44,7 +44,6 @@ from django.db.models import (
     StdDev,
     Subquery,
     Sum,
-    TimeField,
     Value,
     Variance,
 )
@@ -72,7 +71,7 @@ from strawberry_django_aggregates.granularity import (
     TimeGranularity,
     validate_week_start,
 )
-from strawberry_django_aggregates.operators import AggregateOp
+from strawberry_django_aggregates.operators import AggregateOp, _field_kind
 
 if TYPE_CHECKING:
     from django.db.models import Model, QuerySet
@@ -105,6 +104,17 @@ _POSTGRES_ONLY_OPS: frozenset[AggregateOp] = frozenset({
 HAVING_COMPARISONS: tuple[str, ...] = (
     "gt", "lt", "lte", "gte", "eq", "neq", "in", "not_in",
 )
+
+_TEMPORAL_TYPES: frozenset[str] = frozenset({
+    "DateField", "DateTimeField", "TimeField",
+})
+"""Stored types a granularity applies to (``_field_kind(...).stored``)."""
+
+_NARROW_INTEGER_TYPES: frozenset[str] = frozenset({
+    "IntegerField", "SmallIntegerField",
+    "PositiveIntegerField", "PositiveSmallIntegerField",
+})
+"""Stored integer types whose SUM widens to ``bigint``."""
 
 # Mapping NumberGranularity → Django Extract lookup_name.
 # Django's Trunc/Extract handle the tz wrap correctly — postgres backend
@@ -1610,7 +1620,8 @@ def _build_group_by_expression(
     if granularity is None:
         return source
 
-    if not isinstance(field, (DateField, DateTimeField, TimeField)):
+    stored = _field_kind(field).stored
+    if stored not in _TEMPORAL_TYPES:
         raise GranularityNotApplicable(
             f"Granularity {granularity!r} cannot apply to field "
             f"`{field_path}` of type {type(field).__name__}."
@@ -1619,7 +1630,7 @@ def _build_group_by_expression(
     # Trunc/Extract emit `AT TIME ZONE` *before* truncation when
     # ``tzinfo`` is set — the wrap order Odoo gets right
     # (postgres operations.py:135). Date fields don't carry a tz.
-    is_dt = isinstance(field, DateTimeField)
+    is_dt = stored == "DateTimeField"
     tz_kw: dict[str, Any] = {"tzinfo": tzinfo} if is_dt else {}
 
     if isinstance(granularity, TimeGranularity):
@@ -1667,7 +1678,9 @@ def _trunc_week_shifted(
 
     delta = datetime.timedelta(days=offset)
     out_field: Any = (
-        DateTimeField() if isinstance(field, DateTimeField) else DateField()
+        DateTimeField()
+        if _field_kind(field).stored == "DateTimeField"
+        else DateField()
     )
     shifted_in = ExpressionWrapper(
         source_expression + delta, output_field=out_field,
@@ -1997,17 +2010,8 @@ def _output_field_for_traversal(
     # outer fold doesn't truncate. Decimal / Float / Duration leaves
     # are unaffected.
     if op is AggregateOp.SUM and inner is not None:
-        from django.db.models import (
-            BigIntegerField,
-            IntegerField,
-            PositiveIntegerField,
-            PositiveSmallIntegerField,
-            SmallIntegerField,
-        )
-        if isinstance(inner, (
-            IntegerField, SmallIntegerField,
-            PositiveIntegerField, PositiveSmallIntegerField,
-        )) and not isinstance(inner, BigIntegerField):
+        from django.db.models import BigIntegerField
+        if _field_kind(inner).stored in _NARROW_INTEGER_TYPES:
             return BigIntegerField()
     return inner
 

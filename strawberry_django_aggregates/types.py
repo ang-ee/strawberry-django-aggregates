@@ -51,6 +51,7 @@ from strawberry_django_aggregates.errors import (
     JSONPathNotAllowed,
 )
 from strawberry_django_aggregates.granularity import (
+    _TIME_OF_DAY,
     NumberGranularity,
     TimeGranularity,
 )
@@ -243,12 +244,6 @@ _COMPARISON_LOOKUP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Field-type → Python-type maps for output-type derivation.
 # ---------------------------------------------------------------------------
-
-_NUMERIC_TYPES: frozenset[str] = frozenset({
-    "IntegerField", "BigIntegerField", "PositiveIntegerField",
-    "PositiveSmallIntegerField", "SmallIntegerField",
-    "FloatField", "DecimalField", "DurationField",
-})
 
 _INTEGRAL_TYPES: frozenset[str] = frozenset({
     "IntegerField", "BigIntegerField", "PositiveIntegerField",
@@ -1264,8 +1259,18 @@ def _emit_group_key(
         # SPEC § 7 (Stream 5). NUMBER granularity (DAY_OF_WEEK etc.) is
         # degenerate — no contiguous interval — and gets no range
         # sibling.
-        if field_type_for(field) in {"DateField", "DateTimeField"}:
+        kind = field_type_for(field)
+        if kind in {"DateField", "DateTimeField"}:
+            # A date-only subclass gets no time-of-day bucket; a plain
+            # DateField keeps the ones it always had (SPEC § 7).
+            skipped = (
+                _TIME_OF_DAY
+                if kind == "DateField" and type(field).__name__ != kind
+                else frozenset()
+            )
             for time_grain in TimeGranularity:
+                if time_grain in skipped:
+                    continue
                 bucket = group_by_alias(field_name, time_grain)
                 key_fields.append((
                     bucket,
@@ -1278,6 +1283,8 @@ def _emit_group_key(
                     None,
                 ))
             for num_grain in NumberGranularity:
+                if num_grain in skipped:
+                    continue
                 key_fields.append((
                     group_by_alias(field_name, num_grain),
                     (int | None),

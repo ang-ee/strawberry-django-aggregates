@@ -32,6 +32,7 @@ jobs:
       - name: Verify release version
         run: |
           python - <<'PY'
+          import datetime
           import os
           import pathlib
           import re
@@ -49,10 +50,23 @@ jobs:
           match = re.search(r'^__version__ = "([^"]+)"$', init_text, re.M)
           package_version = match.group(1) if match else None
 
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          heading = re.search(r"^## \[([^\]]+)\] — (\d{4}-\d{2}-\d{2})\b", changelog, re.M)
+          top = re.search(r"^## .*$", changelog, re.M)
+
+          try:
+              dated = heading is not None and bool(datetime.date.fromisoformat(heading.group(2)))
+          except ValueError:
+              dated = False
+          if top is None or not dated or top.start() != heading.start():
+              print("The changelog's top entry must be headed with the release version and a date.")
+              sys.exit(1)
+
           versions = {
               "tag": expected,
               "pyproject.toml": project_version,
               "__init__.py": package_version,
+              "CHANGELOG.md": heading.group(1),
           }
           if len(set(versions.values())) != 1:
               for name, version in versions.items():
@@ -60,6 +74,13 @@ jobs:
               print("Release versions must match.")
               sys.exit(1)
           PY
+
+      - name: Run the CI checks
+        run: |
+          uv sync --all-extras --group dev
+          uv run ruff check .
+          uv run mypy strawberry_django_aggregates/
+          uv run pytest
 
       - name: Build distributions
         run: uv build --out-dir dist

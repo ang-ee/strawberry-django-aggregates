@@ -1,0 +1,300 @@
+# BuiltinFields
+type BuiltinFieldsArrayAggFields {
+  id: [ID!]
+  char: [String!]
+  email: [String!]
+  slug: [String!]
+  text: [String!]
+  url: [String!]
+  uuid: [UUID!]
+  shelf: [ID!]
+}
+type BuiltinFieldsAvgFields {
+  bigInt: Float
+  dec: Decimal
+  flt: Float
+  integer: Float
+  posInt: Float
+  posSmall: Float
+  small: Float
+  choice: Float
+}
+type BuiltinFieldsBoolAndFields {
+  boolean: Boolean
+}
+type BuiltinFieldsBoolOrFields {
+  boolean: Boolean
+}
+type BuiltinFieldsGroupKey {
+  id: ID
+  bigInt: Int
+  binary: String
+  boolean: Boolean
+  char: String
+  date: Date
+  dateYear: DateTime
+  dateYearRange: BucketRange
+  dateQuarter: DateTime
+  dateQuarterRange: BucketRange
+  dateMonth: DateTime
+  dateMonthRange: BucketRange
+  dateWeek: DateTime
+  dateWeekRange: BucketRange
+  dateDay: DateTime
+  dateDayRange: BucketRange
+  dateHour: DateTime
+  dateHourRange: BucketRange
+  dateMinute: DateTime
+  dateMinuteRange: BucketRange
+  dateSecond: DateTime
+  dateSecondRange: BucketRange
+  dateYearNumber: Int
+  dateQuarterNumber: Int
+  dateMonthNumber: Int
+  dateIsoWeekNumber: Int
+  dateDayOfYear: Int
+  dateDayOfMonth: Int
+  dateDayOfWeek: Int
+  dateHourNumber: Int
+  dateMinuteNumber: Int
+  dateSecondNumber: Int
+  moment: DateTime
+  momentYear: DateTime
+  momentYearRange: BucketRange
+  momentQuarter: DateTime
+  momentQuarterRange: BucketRange
+  momentMonth: DateTime
+  momentMonthRange: BucketRange
+  momentWeek: DateTime
+  momentWeekRange: BucketRange
+  momentDay: DateTime
+  momentDayRange: BucketRange
+  momentHour: DateTime
+  momentHourRange: BucketRange
+  momentMinute: DateTime
+  momentMinuteRange: BucketRange
+  momentSecond: DateTime
+  momentSecondRange: BucketRange
+  momentYearNumber: Int
+  momentQuarterNumber: Int
+  momentMonthNumber: Int
+  momentIsoWeekNumber: Int
+  momentDayOfYear: Int
+  momentDayOfMonth: Int
+  momentDayOfWeek: Int
+  momentHourNumber: Int
+  momentMinuteNumber: Int
+  momentSecondNumber: Int
+  dec: Decimal
+  email: String
+  path: String
+  flt: Float
+  ip: String
+  integer: Int
+  posBig: String
+  posInt: Int
+  posSmall: Int
+  slug: String
+  small: Int
+  text: String
+  time: Time
+  url: String
+  uuid: UUID
+  file: String
+  json: JSON
+  shelfId: ID
+  choice: BuiltinFieldsChoice
+}
+type BuiltinFieldsMaxFields {
+  bigInt: Int
+  char: String
+  date: Date
+  moment: DateTime
+  dec: Decimal
+  email: String
+  flt: Float
+  integer: Int
+  posInt: Int
+  posSmall: Int
+  slug: String
+  small: Int
+  text: String
+  time: Time
+  url: String
+  choice: Int
+}
+type BuiltinFieldsMinFields {
+  bigInt: Int
+  char: String
+  date: Date
+  moment: DateTime
+  dec: Decimal
+  email: String
+  flt: Float
+  integer: Int
+  posInt: Int
+  posSmall: Int
+  slug: String
+  small: Int
+  text: String
+  time: Time
+  url: String
+  choice: Int
+}
+type BuiltinFieldsModeFields {
+  bigInt: Int
+  char: String
+  date: Date
+  moment: DateTime
+  dec: Decimal
+  email: String
+  flt: Float
+  integer: Int
+  posInt: Int
+  posSmall: Int
+  slug: String
+  small: Int
+  text: String
+  time: Time
+  url: String
+  choice: Int
+}
+type BuiltinFieldsStddevFields {
+  bigInt: Float
+  dec: Float
+  flt: Float
+  integer: Float
+  posInt: Float
+  posSmall: Float
+  small: Float
+  choice: Float
+}
+type BuiltinFieldsStddevPopFields {
+  bigInt: Float
+  dec: Float
+  flt: Float
+  integer: Float
+  posInt: Float
+  posSmall: Float
+  small: Float
+  choice: Float
+}
+type BuiltinFieldsStringAggFields {
+  char: String
+  email: String
+  slug: String
+  text: String
+  url: String
+}
+type BuiltinFieldsSumFields {
+  bigInt: BigInt
+  dec: Decimal
+  flt: Float
+  integer: BigInt
+  posInt: BigInt
+  posSmall: BigInt
+  small: BigInt
+  choice: BigInt
+}
+type BuiltinFieldsVarPopFields {
+  bigInt: Float
+  dec: Float
+  flt: Float
+  integer: Float
+  posInt: Float
+  posSmall: Float
+  small: Float
+  choice: Float
+}
+type BuiltinFieldsVarianceFields {
+  bigInt: Float
+  dec: Float
+  flt: Float
+  integer: Float
+  posInt: Float
+  posSmall: Float
+  small: Float
+  choice: Float
+}
+# Contact
+type ContactArrayAggFields {
+  id: [ID!]
+  email: [String!]
+  url: [String!]
+  slug: [String!]
+}
+type ContactGroupKey {
+  id: ID
+  email: String
+  url: String
+  slug: String
+  taggedEmail: String
+  taggedUrl: String
+  taggedSlug: String
+}
+type ContactMaxFields {
+  email: String
+  url: String
+  slug: String
+}
+type ContactMinFields {
+  email: String
+  url: String
+  slug: String
+}
+type ContactModeFields {
+  email: String
+  url: String
+  slug: String
+}
+type ContactStringAggFields {
+  email: String
+  url: String
+  slug: String
+}
+# Volume
+type VolumeArrayAggFields {
+  id: [ID!]
+  shelf: [ID!]
+  title: [String!]
+}
+type VolumeAvgFields {
+  pages: Float
+}
+type VolumeGroupKey {
+  id: ID
+  shelfId: ID
+  title: String
+  pages: Int
+  Order: String
+}
+type VolumeMaxFields {
+  title: String
+  pages: Int
+}
+type VolumeMinFields {
+  title: String
+  pages: Int
+}
+type VolumeModeFields {
+  title: String
+  pages: Int
+}
+type VolumeStddevFields {
+  pages: Float
+}
+type VolumeStddevPopFields {
+  pages: Float
+}
+type VolumeStringAggFields {
+  title: String
+}
+type VolumeSumFields {
+  pages: BigInt
+}
+type VolumeVarPopFields {
+  pages: Float
+}
+type VolumeVarianceFields {
+  pages: Float
+}

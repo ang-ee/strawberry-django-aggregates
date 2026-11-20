@@ -5,7 +5,128 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
-## [0.14.2] — Unreleased
+## [0.15.0] — 2026-11-20
+
+Supersedes 0.14.2, which was removed from PyPI on 2026-11-20; the `v0.14.2`
+tag remains in the repository's history and should not be installed from
+source. This is a minor release because it changes the GraphQL type of
+affected fields, which this library's policy puts in a minor during 0.x; with
+0.14.2 removed, a `>=0.14,<0.15` range resolves to 0.14.1. A removed
+version's files can never be uploaded again, so nothing is published as 0.14.2.
+
+### Changed
+
+- A subclass of a Django temporal or numeric field that stores, selects and
+  returns that field's values aggregates as that field (SPEC § 5): a
+  created-time field on `DateTimeField`, an amount field on `DecimalField`, an
+  `IntegerField` subclass returning integers. An upgrader from 0.14.1 with such
+  a field meets all of this, and must regenerate its client types:
+  - its group key's type goes from `String` to the typed scalar (`DateTime`,
+    `Date`, `Time`, `Decimal`, `Int`, `Float`), and its wire form with it: a
+    datetime key from `"2026-04-03 12:00:00+00:00"` to the ISO form
+    `"2026-04-03T12:00:00+00:00"`, an integer key from `"3"` to `3`, a float
+    key from `"1.5"` to `1.5`;
+  - each measure a caller had already allowed through `operators=` takes the
+    scalar of the field's base type, as that type's own measures do (§ 5's
+    table): `sum` and `min`/`max` go from `String` to `Decimal`, `BigInt`,
+    `Int` or `Float` (an integer `min` on the wire from `"3"` to `3`, a float
+    one from `"1.5"` to `1.5`), `min`/`max` of a date, time or datetime
+    subclass from `String` to `Date`, `Time` or `DateTime` (a datetime in the
+    ISO form), and `avg` of a decimal subclass from `Float` to `Decimal` (on the
+    wire from `3.75` to `"3.75"`);
+  - the HAVING inputs follow (here for fields `amount`, `units` and `stamp`):
+    `sumAmountGt: String` becomes `Decimal`,
+    `sumUnitsGt: String` becomes `BigInt`, `minUnitsGt: String` becomes `Int`,
+    `avgAmountGt: Float` becomes `Decimal`, `maxStampGt: String` becomes
+    `DateTime`, so an existing operation that declares `$x: Float` for one is
+    rejected at validation until it is regenerated;
+  - it gains the date buckets of its base type (a date-only subclass without
+    the time-of-day ones) and, under the default allowlists, the measures of its
+    base type (`sum`, `avg`, `min`, `max` and the others of § 5's table);
+  - a datetime subclass with `choices` loses its group key's enum type: the key
+    becomes `DateTime`;
+  - a foreign key whose `to_field` is such a subclass retypes its `Id` key from
+    `String` to its target's scalar (`Int` for an integer subclass, `Date` for a
+    date one).
+  Every other field answers as on 0.14.1, Django's own built-ins byte for byte
+  (`tests/golden_sdl.py`).
+
+### Added
+
+- `field_type_for(field)` is public API, new relative to 0.14.1: the Django
+  field type a field aggregates as, which its default operators
+  (`default_operators_for(field_type_for(field))`), GraphQL types and date
+  buckets follow.
+
+### Fixed
+
+- 0.14.2 typed every field by `field.get_internal_type()` and so changed what
+  nobody asked to change. Against 0.14.1 it advertised date buckets on a
+  `GeneratedField` that every query then refused (`GranularityNotApplicable`),
+  failed schema construction (`TypeError` on `timedelta`) for a `DurationField`
+  subclass or a generated duration column, typed a field by what it stores
+  rather than the value the ORM returns (an `IntegerField` subclass returning an
+  opaque token or an enum member got an `Int` key and numeric operators, a
+  `UUIDField` subclass `array_agg`), retyped Django's own `_order` column of
+  `order_with_respect_to` with default measures that answered null, and gave a
+  reverse relation listed in `aggregate_fields` a default `array_agg`. This
+  release keeps what 0.14.2 was for and restores 0.14.1 for everything else:
+  - one internal owner decides what a field is, for the schema and the compiler
+    alike. The compiler reads the Django temporal or numeric type the field is
+    an instance of, for date truncation, the time zone wrap and the widened
+    integer sum, exactly as 0.14.1 decided them; the schema reads the type
+    `field_type_for` returns;
+  - a subclass aggregates as its base field only when its class is not one of
+    Django's own, its `get_internal_type()` names that field, and it overrides
+    none of `db_type`, `db_parameters`, `from_db_value`, `get_db_converters`,
+    `select_format` and `to_python`, on its class or its instance. A subclass
+    overriding any of them, `to_python` included, keeps its class name and opts
+    in through `operators=`; django-money's `MoneyField` is such a case;
+  - every other field answers by its class name, as on 0.14.1: a string, UUID,
+    boolean, duration, relation or id field and every subclass of one (a text
+    subclass still gets no default string operator, while `EmailField`,
+    `URLField` and `SlugField` keep theirs), a `GeneratedField` of any output, a
+    text one included (no date buckets), Django's `OrderWrt` and the auto
+    primary keys, and a reverse relation.
+- The publish workflow runs the CI checks (ruff, mypy, pytest) before it builds,
+  and refuses a release whose changelog top entry is not headed with the tag's
+  version and a date.
+
+### Known limits, to revisit in the next minor
+
+- `to_python` is not on the ORM's read path, so a subclass overriding only it
+  (django-money's `MoneyField`) returns its base type's values and still keeps
+  its class name: the rule is deliberately conservative.
+
+### Known issues (unchanged from 0.14.1)
+
+- A plain `DurationField` in the default aggregate allowlist fails schema
+  construction (`TypeError` on `timedelta`): no GraphQL scalar carries a
+  duration. Leave it out of `aggregate_fields` or give it `operators=`.
+- A plain `DateField` advertises the `hour`, `minute` and `second` buckets and
+  their number parts; a query of one fails with a `ValueError`. A date-only
+  subclass no longer advertises them.
+- A granularity on a `TimeField`, or on a temporal subclass that keeps its class
+  name, passes the compiler and raises an internal `TypeError` from the group
+  key's constructor.
+- `compute_aggregation` accepts a single-segment reverse foreign key as a
+  measure (`MAX("orders")`), against Critical Rule 4, which only the `__`
+  traversal guard enforces.
+- A `BinaryField` in the default group-by allowlist fails when its key is
+  serialized.
+- `PositiveBigIntegerField` is a `String` key with no default operators.
+- Explicitly allowing a measure on `_order` (`order_with_respect_to`) answers
+  null: the camel-case walker does not map `Order` back to `_order`. It is no
+  longer reachable by default.
+- A project class named like a Django built-in without being one (a `DateField`
+  subclassing `CharField`) is answered by its class name, so the schema
+  describes it as that built-in, date buckets included, while the compiler,
+  which reads what the column is, refuses a granularity on it.
+
+## [0.14.2] — 2026-11-20 — removed from PyPI, superseded by 0.15.0
+
+Removed from PyPI on 2026-11-20 and superseded by 0.15.0; the `v0.14.2` tag
+remains in the repository's history and should not be installed from source.
 
 ### Fixed
 
