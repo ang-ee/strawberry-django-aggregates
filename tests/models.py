@@ -114,3 +114,39 @@ class ChoiceRecord(models.Model):
 
     class Meta:
         app_label = "tests"
+
+
+class StampField(models.DateTimeField):
+    """A ``DateTimeField`` that only changes how its value is stamped."""
+
+
+class AmountField(models.DecimalField):
+    """A ``DecimalField`` with a rule of its own."""
+
+
+class SealedTextField(models.TextField):
+    """A ``TextField`` whose stored text no default operator may expose."""
+
+
+class Reading(models.Model):
+    """Field subclasses aggregate as the Django field type they store.
+
+    SPEC § 5 (per-field-type defaults) and § 7 (date buckets): a subclass
+    of a temporal, numeric, boolean or id field, and a ``GeneratedField``
+    by its ``output_field``, take that type's GraphQL type, buckets and
+    default operators; a subclass of a string field keeps no default
+    string operator until the caller allows it.
+    """
+
+    taken_at    = models.DateTimeField()
+    stamped_at  = StampField()
+    amount      = AmountField(max_digits=10, decimal_places=2)
+    note        = SealedTextField(blank=True, default="")
+    mirrored_at = models.GeneratedField(
+        expression=models.F("taken_at"),
+        output_field=models.DateTimeField(),
+        db_persist=True,
+    )
+
+    class Meta:
+        app_label = "tests"

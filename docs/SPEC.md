@@ -473,6 +473,24 @@ Field types map to default operator allowlists. Consumers can narrow further via
 
 `count` and `count_distinct` are always present at the type level (operate on rows, not on a measure).
 
+**Which type a field is.** A field counts as the Django field type it stores,
+`field.get_internal_type()` (`field_type_for(field)`), for every decision this
+library makes about it: the default operators above, the result types of
+`sum`, `avg`, `min`, `max`, `mode` and `array_agg` (§ 5's table), its type on
+`<Model>GroupKey`, and its date buckets (§ 7). So a subclass of a Django field,
+which keeps its column, its SQL and its Python values, aggregates as that field
+(a `DateTimeField` subclass gets the `DateTimeField` row, a `DecimalField`
+subclass `Decimal` sums and averages), and a `GeneratedField` aggregates as its
+`output_field`. **String types are the one exception:** a field Django stores as
+one of the string types in the table keeps its exact class name, so a subclass
+of a text field (one that seals or encodes what it stores, say) gets no default
+operator and the caller opts it in through `operators=`; Django's own
+`EmailField`, `URLField` and `SlugField` keep their row. Defaults are
+explicit allowlisting: inheriting a datetime's or a decimal's operators is the
+same SQL on the same column, while widening string defaults silently would
+expose stored text. A subclass of an integer field that stores a code inherits
+the numeric defaults; narrow it with `operators=`.
+
 **JSON-path declared types.** Stream 17 introduces a parallel table for
 typed dotted paths on `JSONField` columns. See § 6.1 for the wire format
 and full default operator table.
@@ -988,6 +1006,11 @@ class NumberGranularity(StrEnum):
 ```
 
 The NUMBER track is the canonical way to ask "orders per day-of-week" or "signups per hour-of-day across all dates" (cohort/heatmap analytics). Odoo learned this in 17.3 (PR #159528) and we ship it day-1.
+
+Both tracks apply to every group-by field Django stores as a `DateField` or
+`DateTimeField` (§ 5, "Which type a field is"): a subclass of either and a
+`GeneratedField` whose `output_field` is one get the per-granularity bucket keys
+on `<Model>GroupKey` and their `_range` siblings like the field itself.
 
 ### Bucket range siblings — `<field>_<granularity>_range`
 

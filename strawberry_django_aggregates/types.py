@@ -58,6 +58,7 @@ from strawberry_django_aggregates.operators import (
     AggregateOp,
     default_operators_for,
     default_operators_for_json_type,
+    field_type_for,
 )
 from strawberry_django_aggregates.rows import is_row_model
 
@@ -293,7 +294,7 @@ def _natural_python_type(field: Field) -> Any:
     Used for MIN/MAX/ARRAY_AGG (where the result type matches the
     field type) and for the group_key composite type.
     """
-    name = type(field).__name__
+    name = field_type_for(field)
     if name == "DecimalField":
         return decimal.Decimal
     if name in {"FloatField"}:
@@ -416,7 +417,7 @@ def _choices_enum_for(
     Reads ``field.choices_enum`` via ``getattr`` only — the library has
     no dependency on django-choices-field.
     """
-    if type(field).__name__ in {"DateField", "DateTimeField", "TimeField"}:
+    if field_type_for(field) in {"DateField", "DateTimeField", "TimeField"}:
         return None
     choices = getattr(field, "choices", None)
     if not choices:
@@ -507,12 +508,13 @@ def _aggregate_python_type(op: AggregateOp, field: Field) -> Any:
     """Output Python type for ``(op, field)`` — drives nested-type fields."""
     if op in {AggregateOp.MIN, AggregateOp.MAX}:
         return _natural_python_type(field)
+    kind = field_type_for(field)
     if op is AggregateOp.SUM:
-        if type(field).__name__ == "DecimalField":
+        if kind == "DecimalField":
             return decimal.Decimal
-        if type(field).__name__ == "FloatField":
+        if kind == "FloatField":
             return float
-        if type(field).__name__ in _INTEGRAL_TYPES:
+        if kind in _INTEGRAL_TYPES:
             # Integer-field SUM widens to Postgres ``bigint``; the
             # 32-bit GraphQL ``Int`` would silently overflow above
             # 2**31 - 1, and JS ``Number`` is unsafe past 2**53. Emit
@@ -523,7 +525,7 @@ def _aggregate_python_type(op: AggregateOp, field: Field) -> Any:
             return BigInt
         return _natural_python_type(field)
     if op is AggregateOp.AVG:
-        if type(field).__name__ == "DecimalField":
+        if kind == "DecimalField":
             return decimal.Decimal
         return float
     if op in {
@@ -642,8 +644,7 @@ def _resolve_aggregate_fields(
         if getattr(field, "many_to_many", False) \
                 or getattr(field, "one_to_many", False):
             continue
-        type_name = type(field).__name__
-        if default_operators_for(type_name):
+        if default_operators_for(field_type_for(field)):
             eligible.append(field.name)
     # Append JSON paths in caller-declared order. Sorted to honour
     # CLAUDE.md Critical Rule 2 — iteration over the dict can otherwise
@@ -702,7 +703,7 @@ def _allowed_ops_for(
     if json_paths and field_name in json_paths:
         return default_operators_for_json_type(json_paths[field_name])
     field = model._meta.get_field(field_name)
-    return default_operators_for(type(field).__name__)
+    return default_operators_for(field_type_for(field))
 
 
 # ---------------------------------------------------------------------------
@@ -1263,7 +1264,7 @@ def _emit_group_key(
         # SPEC § 7 (Stream 5). NUMBER granularity (DAY_OF_WEEK etc.) is
         # degenerate — no contiguous interval — and gets no range
         # sibling.
-        if type(field).__name__ in {"DateField", "DateTimeField"}:
+        if field_type_for(field) in {"DateField", "DateTimeField"}:
             for time_grain in TimeGranularity:
                 bucket = group_by_alias(field_name, time_grain)
                 key_fields.append((

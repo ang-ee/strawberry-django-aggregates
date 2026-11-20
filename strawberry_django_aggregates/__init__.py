@@ -105,6 +105,7 @@ from strawberry_django_aggregates.granularity import (
 from strawberry_django_aggregates.operators import (
     AggregateOp,
     default_operators_for,
+    field_type_for,
 )
 from strawberry_django_aggregates.ordering import (
     comodel_ordering_terms,
@@ -133,7 +134,7 @@ from strawberry_django_aggregates.types import (
     python_type_for_json,
 )
 
-__version__ = "0.14.1"
+__version__ = "0.14.2"
 
 __all__ = [
     # Builder (high-level)
@@ -157,6 +158,7 @@ __all__ = [
     "NumberGranularity",
     "validate_week_start",
     "default_operators_for",
+    "field_type_for",
     # Aliasing — enforced single owner of the (field, granularity) → alias
     # rule; consumers MUST NOT recompute (FK -> ``_id``, granularity
     # suffix, JSON ``.`` -> ``__`` rewrite).

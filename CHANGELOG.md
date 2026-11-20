@@ -5,6 +5,24 @@ The project follows [Semantic Versioning](https://semver.org/). During the
 `0.x` line, minor releases may include controlled breaking changes; see
 `docs/SPEC.md` § 16 for the eventual 1.0 SemVer surface.
 
+## [0.14.2] — Unreleased
+
+### Fixed
+
+- A field is aggregated as the Django field type it stores,
+  `field.get_internal_type()`, not by its class name. A subclass of a Django
+  field (a `DateTimeField` subclass, a `DecimalField` subclass) and a
+  `GeneratedField` were treated as an unknown type: no date buckets on the
+  group key, `String` group-key and MIN/MAX types, SUM and AVG of a decimal
+  subclass typed `String` and `Float`, and no default operators. They now
+  aggregate as the field they store: a `DateTimeField` subclass groups by month
+  like a `DateTimeField`, a `GeneratedField` like its `output_field`. String
+  types keep their exact class name, so a subclass of a text field still gets
+  no default string operator and opts in through `operators=`. Plain fields are
+  unchanged. `field_type_for(field)` answers the type a field is aggregated as,
+  and `default_operators_for(field_type_for(field))` its default operators. See
+  `docs/SPEC.md` § 5 and § 7.
+
 ## [0.14.1] — 2026-11-07
 
 ### Fixed
